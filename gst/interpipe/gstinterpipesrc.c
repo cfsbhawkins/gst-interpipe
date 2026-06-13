@@ -55,7 +55,10 @@ GST_DEBUG_CATEGORY_STATIC (gst_inter_pipe_src_debug);
 enum
 {
   PROP_0,
-  PROP_LISTEN_TO,
+  /* Offset own property ids well above the inherited GstAppSrc range so they
+   * never collide with parent property ids (is-live, format, block, ...).
+   * Inherited properties fall through to the chained-up default case. */
+  PROP_LISTEN_TO = 0x100,
   PROP_BLOCK_SWITCH,
   PROP_ALLOW_RENEGOTIATION,
   PROP_STREAM_SYNC,
@@ -315,7 +318,10 @@ gst_inter_pipe_src_set_property (GObject * object, guint prop_id,
       src->accept_eos_event = g_value_get_boolean (value);
       break;
     default:
-      G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+      /* Chain inherited GstAppSrc properties (is-live, format, block, ...)
+       * up to the parent so they are actually applied. */
+      G_OBJECT_CLASS (gst_inter_pipe_src_parent_class)->set_property (object,
+          prop_id, value, pspec);
       break;
   }
 }
@@ -350,7 +356,8 @@ gst_inter_pipe_src_get_property (GObject * object, guint prop_id,
       g_value_set_boolean (value, src->accept_eos_event);
       break;
     default:
-      G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+      G_OBJECT_CLASS (gst_inter_pipe_src_parent_class)->get_property (object,
+          prop_id, value, pspec);
       break;
   }
 }

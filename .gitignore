@@ -5,6 +5,14 @@ cscope.files
 cscope.out
 .clang_complete
 
+# Meson build directory
+/build/
+
+# Claude Code — keep shared CLAUDE.md and .claude/ config tracked,
+# ignore only local/private overrides and secrets.
+.claude/settings.local.json
+CLAUDE.local.md
+
 *Makefile
 *Makefile.in
 aclocal.m4

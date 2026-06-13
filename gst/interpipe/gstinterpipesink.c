@@ -53,7 +53,10 @@ GST_DEBUG_CATEGORY_STATIC (gst_inter_pipe_sink_debug);
 enum
 {
   PROP_0,
-  PROP_FORWARD_EOS,
+  /* Offset own property ids well above the inherited GstAppSink/GstBaseSink
+   * range so they never collide with parent property ids (sync, async, ...).
+   * Inherited properties fall through to the chained-up default case. */
+  PROP_FORWARD_EOS = 0x100,
   PROP_FORWARD_EVENTS,
   PROP_NUM_LISTENERS
 };
@@ -252,7 +255,10 @@ gst_inter_pipe_sink_set_property (GObject * object, guint prop_id,
       sink->forward_events = g_value_get_boolean (value);
       break;
     default:
-      G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+      /* Chain inherited GstAppSink/GstBaseSink properties (sync, async, ...)
+       * up to the parent so they are actually applied. */
+      G_OBJECT_CLASS (gst_inter_pipe_sink_parent_class)->set_property (object,
+          prop_id, value, pspec);
       break;
   }
 }
@@ -276,7 +282,8 @@ gst_inter_pipe_sink_get_property (GObject * object, guint prop_id,
       g_mutex_unlock (&sink->listeners_mutex);
       break;
     default:
-      G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+      G_OBJECT_CLASS (gst_inter_pipe_sink_parent_class)->get_property (object,
+          prop_id, value, pspec);
       break;
   }
 }

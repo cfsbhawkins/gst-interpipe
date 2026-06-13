@@ -1,0 +1,55 @@
+# Debian Sid to match the main Dockerfile — both images pull GStreamer 1.28.x
+# so valgrind runs cover the same runtime as the regular test image.
+FROM debian:sid-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    pkg-config \
+    ninja-build \
+    meson \
+    curl \
+    ca-certificates \
+    libglib2.0-dev \
+    libgstreamer1.0-dev \
+    libgstreamer-plugins-base1.0-dev \
+    gstreamer1.0-plugins-base \
+    gstreamer1.0-tools \
+    valgrind \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /gst-interpipe
+
+# Valgrind needs suppressions for the framework's one-time allocations (GLib type
+# registration, GStreamer registry, thread-private data) or they swamp real leaks.
+# GLib ships its own; GStreamer's lives in the upstream tree, so fetch it. Combine
+# them into one file referenced by the test wrapper below.
+# Join with an explicit newline — glib.supp ships without a trailing one, so a
+# bare `cat` would weld its final "}" onto the next file's first line.
+RUN curl -sSL -o /opt/gstreamer.supp \
+      "https://gitlab.freedesktop.org/gstreamer/gstreamer/-/raw/main/subprojects/gstreamer/tests/check/gstreamer.supp" \
+    && { cat /usr/share/glib-2.0/valgrind/glib.supp; echo; cat /opt/gstreamer.supp; } \
+      > /opt/interpipe.supp
+
+# Copy source code
+COPY . .
+
+# Build with debug symbols for readable valgrind backtraces (docs disabled).
+RUN meson setup build -Dbuildtype=debug -Denable-gtk-doc=false && ninja -C build
+
+# Run the suite under valgrind. CK_FORK=no keeps gstcheck in a single process so
+# valgrind tracks every allocation; the GLib env knobs swap GSlice for plain malloc
+# so real leaks aren't hidden behind GSlice's arena. --timeout-multiplier covers
+# valgrind's ~20-50x slowdown on the clock-paced tests.
+#
+# This is a DIAGNOSTIC, not a pass/fail gate: even after the GLib+GStreamer
+# suppressions, the gstcheck harness leaks element/registry instances at exit
+# (the tests don't fully tear pipelines down before _exit). Those residuals are
+# upstream framework noise, not plugin bugs, so we report rather than fail on them.
+# To vet a plugin change for leaks, run this image before and after and diff the
+# "definitely/indirectly lost" totals per test — they should be identical.
+ENV CK_FORK=no \
+    G_SLICE=always-malloc \
+    G_DEBUG=gc-friendly
+CMD ["sh", "-c", "meson test -C build --timeout-multiplier 60 --wrap='valgrind --leak-check=full --show-leak-kinds=definite,indirect --errors-for-leak-kinds=definite,indirect --suppressions=/opt/interpipe.supp'"]
