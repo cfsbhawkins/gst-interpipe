@@ -81,7 +81,10 @@ gst_inter_pipe_get_nodes (void)
   static GHashTable *gst_inter_pipe_nodes = NULL;
 
   if (!gst_inter_pipe_nodes) {
-    gst_inter_pipe_nodes = g_hash_table_new (g_str_hash, g_str_equal);
+    /* Own the key strings so the table never depends on the node's name
+     * outliving its entry. */
+    gst_inter_pipe_nodes =
+        g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
   }
   return gst_inter_pipe_nodes;
 }
@@ -320,7 +323,7 @@ gst_inter_pipe_add_node (GstInterPipeINode * node, const gchar * node_name)
 
   GST_INFO ("Adding node %s", node_name);
 
-  if (!g_hash_table_insert (nodes, (gchar *) node_name, (gpointer) node))
+  if (!g_hash_table_insert (nodes, g_strdup (node_name), (gpointer) node))
     goto add_error;
 
   g_mutex_unlock (&nodes_mutex);
