@@ -445,6 +445,15 @@ gst_inter_pipe_sink_get_caps (GstBaseSink * base, GstCaps * filter)
     return filter;
   }
 
+  /* Recompute from scratch: intersect_listener_caps folds each listener into
+   * the existing caps_negotiated, so a stale value left from a previous
+   * negotiation could only ever narrow the result (a listener that renegotiated
+   * to broader caps could never widen it back). Clear it first. */
+  if (sink->caps_negotiated) {
+    gst_caps_unref (sink->caps_negotiated);
+    sink->caps_negotiated = NULL;
+  }
+
   /* Intersect the caps of every listener into sink->caps_negotiated. */
   g_hash_table_foreach (listeners, gst_inter_pipe_sink_intersect_listener_caps,
       sink);
@@ -869,18 +878,15 @@ gst_inter_pipe_sink_push_to_listener (gpointer key, gpointer data,
    * buffer with no caps set on its appsrc, which fails downstream
    * negotiation (not-negotiated). When the listener has no caps yet, set them
    * from the current sample's caps first. Listeners that already have caps are
-   * left untouched, so allow-renegotiation behaviour is preserved. */
-  if (caps) {
-    gboolean negotiated = FALSE;
-    GstCaps *listener_caps =
-        gst_inter_pipe_ilistener_get_caps (listener, &negotiated);
-    if (!negotiated) {
-      GST_INFO_OBJECT (sink, "Listener %s has no caps yet; applying node caps "
-          "%" GST_PTR_FORMAT " before its first buffer", listener_name, caps);
-      gst_inter_pipe_ilistener_set_caps (listener, caps);
-    }
-    if (listener_caps)
-      gst_caps_unref (listener_caps);
+   * left untouched, so allow-renegotiation behaviour is preserved.
+   *
+   * is_negotiated is a cheap flag (no downstream caps query) that resets on
+   * every (re)attach, so this primes once per attachment instead of paying a
+   * caps query per buffer. */
+  if (caps && !gst_inter_pipe_ilistener_is_negotiated (listener)) {
+    GST_INFO_OBJECT (sink, "Listener %s has no caps yet; applying node caps "
+        "%" GST_PTR_FORMAT " before its first buffer", listener_name, caps);
+    gst_inter_pipe_ilistener_set_caps (listener, caps);
   }
 
   GST_LOG_OBJECT (sink, "Forwarding buffer %p to %s", buffer, listener_name);
@@ -1031,8 +1037,13 @@ gst_inter_pipe_sink_add_listener (GstInterPipeINode * iface,
     gboolean has_listeners;
     gboolean has_negotiated_caps;
 
-    if (!sinkcaps)
+    if (!sinkcaps) {
+      /* srccaps was taken with a ref by get_caps; the add_to_list path skips
+       * the unrefs below, so release it here before jumping. */
+      if (srccaps)
+        gst_caps_unref (srccaps);
       goto add_to_list;
+    }
 
     /* Snapshot the shared state under the lock so the negotiation decision is
      * made on a consistent view. The lock is not held across the pad and caps

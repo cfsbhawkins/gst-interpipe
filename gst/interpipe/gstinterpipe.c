@@ -44,7 +44,11 @@ typedef struct _GstInterPipeListenerPriv GstInterPipeListenerPriv;
 struct _GstInterPipeListenerPriv
 {
   GstInterPipeIListener *listener;
-  const gchar *listen_to;
+  /* Owned copy of the node name this listener is attached to. Duplicated on
+   * store and freed on replace/remove so it never depends on the listener's
+   * own listen-to string staying alive (which a concurrent property set could
+   * free). */
+  gchar *listen_to;
 };
 
 /* Global mutexes for singletons */
@@ -143,6 +147,7 @@ gst_inter_pipe_listen_node (GstInterPipeIListener * listener,
   } else {
     listener_priv = g_malloc (sizeof (GstInterPipeListenerPriv));
     listener_priv->listener = listener;
+    listener_priv->listen_to = NULL;
     priv_is_new = TRUE;
   }
 
@@ -154,11 +159,13 @@ gst_inter_pipe_listen_node (GstInterPipeIListener * listener,
      when it connects */
   if (node == NULL) {
     GST_INFO ("Node is not available yet, connecting later.");
+    g_free (listener_priv->listen_to);
     listener_priv->listen_to = NULL;
   } else {
     if (!gst_inter_pipe_inode_add_listener (node, listener))
       goto add_failed;
-    listener_priv->listen_to = node_name;
+    g_free (listener_priv->listen_to);
+    listener_priv->listen_to = g_strdup (node_name);
     gst_object_unref (node);
   }
 
@@ -203,6 +210,7 @@ gst_inter_pipe_leave_listeners_table (GstInterPipeIListener * listener)
   if (!g_hash_table_remove (listeners, listener_name))
     return FALSE;
 
+  g_free (listener_priv->listen_to);
   g_free (listener_priv);
 
   return TRUE;
@@ -252,6 +260,7 @@ no_node:
   {
     GST_WARNING ("Node %s not found. Could not leave node.",
         listener_priv->listen_to);
+    g_free (listener_priv->listen_to);
     listener_priv->listen_to = NULL;
     return FALSE;
   }
@@ -261,6 +270,7 @@ remove_error:
         ("The listener %s was not listening to %s, there's something very wrong",
         listener_name, listener_priv->listen_to);
     gst_object_unref (node);
+    g_free (listener_priv->listen_to);
     listener_priv->listen_to = NULL;
     return FALSE;
   }
