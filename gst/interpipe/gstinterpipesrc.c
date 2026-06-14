@@ -627,6 +627,12 @@ gst_inter_pipe_src_set_caps (GstInterPipeIListener * iface,
 
   gst_app_src_set_caps (appsrc, caps);
 
+  /* On a cold attach the base source loop may have already negotiated an empty
+   * state before this node had any caps, so the caps arrive after the fact.
+   * Mark the source pad for reconfigure so the base source renegotiates with
+   * these caps before pushing the next buffer instead of failing downstream. */
+  gst_pad_mark_reconfigure (GST_INTER_PIPE_SRC_PAD (src));
+
   return TRUE;
 
 allow_renegotiation_disabled:
