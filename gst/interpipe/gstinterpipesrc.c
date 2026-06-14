@@ -139,8 +139,10 @@ struct _GstInterPipeSrc
   /* Currently started and listening */
   gboolean listening;
 
-  /* Pending serial events queue */
+  /* Pending serial events queue, guarded by serial_events_lock because it is
+   * pushed from the node's streaming thread and drained from this element's. */
   GQueue *pending_serial_events;
+  GMutex serial_events_lock;
 
   /* Block switch */
   gboolean block_switch;
@@ -241,6 +243,7 @@ gst_inter_pipe_src_init (GstInterPipeSrc * src)
   src->listen_to = NULL;
   src->listening = FALSE;
   src->pending_serial_events = g_queue_new ();
+  g_mutex_init (&src->serial_events_lock);
   src->block_switch = FALSE;
   src->allow_renegotiation = TRUE;
   src->first_switch = TRUE;
@@ -374,6 +377,7 @@ gst_inter_pipe_src_finalize (GObject * object)
   /* Free pending serial events queue */
   g_queue_free_full (src->pending_serial_events,
       (GDestroyNotify) gst_event_unref);
+  g_mutex_clear (&src->serial_events_lock);
 
   if (src->listen_to) {
     g_free (src->listen_to);
@@ -506,29 +510,35 @@ gst_inter_pipe_src_create (GstBaseSrc * base, guint64 offset, guint size,
       "Dequeue buffer %p with timestamp (PTS) %" GST_TIME_FORMAT, *buf,
       GST_TIME_ARGS (GST_BUFFER_PTS (*buf)));
 
+  /* Drain the head serial event if its timestamp has been reached. Decide and
+   * dequeue under the lock, but push the event downstream after releasing it so
+   * we never hold the lock across gst_pad_push_event. */
+  serial_event = NULL;
+  g_mutex_lock (&src->serial_events_lock);
   if (!g_queue_is_empty (src->pending_serial_events)) {
+    GstEvent *head = g_queue_peek_head (src->pending_serial_events);
     guint curr_bytes;
-    /*Pending Serial Events Queue */
-    serial_event = g_queue_peek_head (src->pending_serial_events);
 
     GST_DEBUG_OBJECT (src,
         "Got event with timestamp %" GST_TIME_FORMAT,
-        GST_TIME_ARGS (GST_EVENT_TIMESTAMP (serial_event)));
+        GST_TIME_ARGS (GST_EVENT_TIMESTAMP (head)));
 
     curr_bytes = gst_app_src_get_current_level_bytes (GST_APP_SRC (src));
-    if ((GST_EVENT_TIMESTAMP (serial_event) < GST_BUFFER_PTS (*buf))
+    if ((GST_EVENT_TIMESTAMP (head) < GST_BUFFER_PTS (*buf))
         || (curr_bytes == 0)) {
-
-      GST_DEBUG_OBJECT (src, "Sending Serial Event %s",
-          GST_EVENT_TYPE_NAME (serial_event));
-
       serial_event = g_queue_pop_head (src->pending_serial_events);
-      gst_pad_push_event (srcpad, serial_event);
     } else {
       GST_DEBUG_OBJECT (src, "Event %s timestamp is greater than the "
           "buffer timestamp, can't send serial event yet",
-          GST_EVENT_TYPE_NAME (serial_event));
+          GST_EVENT_TYPE_NAME (head));
     }
+  }
+  g_mutex_unlock (&src->serial_events_lock);
+
+  if (serial_event) {
+    GST_DEBUG_OBJECT (src, "Sending Serial Event %s",
+        GST_EVENT_TYPE_NAME (serial_event));
+    gst_pad_push_event (srcpad, serial_event);
   }
 
   return ret;
@@ -794,7 +804,9 @@ gst_inter_pipe_src_push_event (GstInterPipeIListener * iface, GstEvent * event,
         " enqueued on serial pending events", GST_EVENT_TYPE_NAME (event),
         GST_TIME_ARGS (GST_EVENT_TIMESTAMP (event)));
 
+    g_mutex_lock (&src->serial_events_lock);
     g_queue_push_tail (src->pending_serial_events, event);
+    g_mutex_unlock (&src->serial_events_lock);
   }
   return ret;
 no_events:
