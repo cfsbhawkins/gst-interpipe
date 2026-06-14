@@ -37,7 +37,8 @@ G_BEGIN_DECLS
  * appropriate GstInterPipeINode. If the node was not found
  * null will be returned accordingly.
  *
- * Returns: (transfer none)(nullable): The respective GstInterPipeINode or null
+ * Returns: (transfer full)(nullable): The respective GstInterPipeINode or null.
+ * The caller owns a reference and must unref it when done.
  */
 GstInterPipeINode * gst_inter_pipe_get_node (const gchar * node_name);
 

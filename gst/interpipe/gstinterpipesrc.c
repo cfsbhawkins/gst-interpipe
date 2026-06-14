@@ -481,6 +481,9 @@ gst_inter_pipe_src_event (GstBaseSrc * base, GstEvent * event)
       GST_WARNING_OBJECT (src, "Node doesn't exist, event won't be forwarded");
   }
 
+  if (node)
+    gst_object_unref (node);
+
   return basesrc_class->event (base, event);
 }
 

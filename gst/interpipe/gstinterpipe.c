@@ -98,6 +98,10 @@ gst_inter_pipe_get_node (const gchar * node_name)
   nodes = gst_inter_pipe_get_nodes ();
 
   value = (GstInterPipeINode *) g_hash_table_lookup (nodes, node_name);
+  /* Return a strong reference taken under the lock so the node cannot be
+   * removed and finalized while a caller is still using it. */
+  if (value)
+    gst_object_ref (value);
   g_mutex_unlock (&nodes_mutex);
 
   return value;
@@ -152,6 +156,7 @@ gst_inter_pipe_listen_node (GstInterPipeIListener * listener,
     if (!gst_inter_pipe_inode_add_listener (node, listener))
       goto add_failed;
     listener_priv->listen_to = node_name;
+    gst_object_unref (node);
   }
 
   g_hash_table_insert (listeners, (gchar *) listener_name,
@@ -170,6 +175,8 @@ add_failed:
   {
     GST_WARNING ("Could not add listener %s to node %s", listener_name,
         node_name);
+    /* We reach here only from the branch that holds a node reference. */
+    gst_object_unref (node);
     /* A freshly allocated priv was never inserted into the table, so free it
      * here. An existing priv is owned by the table and left in place. */
     if (priv_is_new)
@@ -228,6 +235,7 @@ gst_inter_pipe_leave_node_priv (GstInterPipeIListener * listener)
     if (!gst_inter_pipe_inode_remove_listener (node, listener))
       goto remove_error;
 
+    gst_object_unref (node);
   }
 
   return TRUE;
@@ -249,6 +257,7 @@ remove_error:
     GST_WARNING
         ("The listener %s was not listening to %s, there's something very wrong",
         listener_name, listener_priv->listen_to);
+    gst_object_unref (node);
     listener_priv->listen_to = NULL;
     return FALSE;
   }
