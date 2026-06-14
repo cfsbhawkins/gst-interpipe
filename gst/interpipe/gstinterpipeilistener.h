@@ -89,6 +89,7 @@ struct _GstInterPipeIListenerInterface
   /*<public>*/
   const gchar * (*get_name) (GstInterPipeIListener *iface);
   GstCaps * (*get_caps) (GstInterPipeIListener *iface, gboolean *negotiated);
+  gboolean (*is_negotiated) (GstInterPipeIListener *iface);
   gboolean (*set_caps) (GstInterPipeIListener *iface, const GstCaps *caps);
   gboolean (* node_added) (GstInterPipeIListener *iface, const gchar *node_name);
   gboolean (* node_removed) (GstInterPipeIListener *iface, const gchar *node_removed);
@@ -122,6 +123,20 @@ const gchar * gst_inter_pipe_ilistener_get_name (GstInterPipeIListener *iface);
  * Returns: (transfer full): The #GstCaps supported by the listener's pipeline.
  */
 GstCaps * gst_inter_pipe_ilistener_get_caps (GstInterPipeIListener *iface, gboolean *negotiated);
+
+/**
+ * gst_inter_pipe_ilistener_is_negotiated:
+ * @iface: (transfer none)(not nullable): The object to query.
+ *
+ * Cheaply report whether the listener already holds caps for its current
+ * attachment. Unlike #gst_inter_pipe_ilistener_get_caps this performs no
+ * downstream caps query, so it is safe to call on the per-buffer path. The
+ * result must be reset whenever the listener attaches to a (new) node, so a
+ * switch re-primes caps from the new node.
+ *
+ * Returns: True if caps have already been set for the current attachment.
+ */
+gboolean gst_inter_pipe_ilistener_is_negotiated (GstInterPipeIListener *iface);
 
 /**
  * gst_inter_pipe_ilistener_set_caps:

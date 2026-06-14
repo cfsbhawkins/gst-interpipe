@@ -1,0 +1,41 @@
+# gstd-backed reproduction image for the interpipe cold-attach negotiation race.
+#
+# The race only manifests under gstd's pipeline lifecycle (independent
+# create/play of each leg), not the in-process gstcheck harness. This image
+# builds gstd (cfsbhawkins/gstd-1.x) on top of the same Sid GStreamer the plugin
+# targets, so a harness script can drive the 3-leg split over gstd's HTTP API
+# and observe not-negotiated deterministically.
+#
+# The interpipe plugin itself is built at run time from the bind-mounted source
+# so the same image serves both the unpatched (red) and patched (green) runs.
+FROM debian:sid-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential pkg-config ninja-build meson git ca-certificates curl \
+    libglib2.0-dev \
+    libgstreamer1.0-dev \
+    libgstreamer-plugins-base1.0-dev \
+    gstreamer1.0-plugins-base \
+    gstreamer1.0-plugins-good \
+    gstreamer1.0-tools \
+    libgstreamer-plugins-base1.0-dev \
+    libjson-glib-dev libdaemon-dev libjansson-dev libedit-dev \
+    libsoup-3.0-dev libncurses-dev gobject-introspection \
+    && rm -rf /var/lib/apt/lists/*
+
+# Build and install gstd (matches the deployment's daemon).
+RUN git clone --depth 1 https://github.com/cfsbhawkins/gstd-1.x.git /gstd \
+    && cd /gstd \
+    && meson setup builddir -Denable-tests=disabled -Denable-examples=disabled \
+       -Denable-python=disabled -Denable-systemd=disabled -Denable-gtk-doc=false \
+    && ninja -C builddir \
+    && ninja -C builddir install \
+    && ldconfig \
+    && rm -rf /gstd
+
+# gstd's default run/log state dirs.
+RUN mkdir -p /var/run/gstd /var/log/gstd
+
+WORKDIR /src

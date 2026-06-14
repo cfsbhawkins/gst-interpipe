@@ -113,6 +113,20 @@ gst_inter_pipe_ilistener_get_caps (GstInterPipeIListener * self,
 
 
 gboolean
+gst_inter_pipe_ilistener_is_negotiated (GstInterPipeIListener * self)
+{
+  GstInterPipeIListenerInterface *iface;
+
+  g_return_val_if_fail (GST_INTER_PIPE_IS_ILISTENER (self), FALSE);
+
+  iface = GST_INTER_PIPE_ILISTENER_GET_IFACE (self);
+  g_return_val_if_fail (iface->is_negotiated != NULL, FALSE);
+
+  return iface->is_negotiated (self);
+}
+
+
+gboolean
 gst_inter_pipe_ilistener_set_caps (GstInterPipeIListener * self,
     const GstCaps * caps)
 {

@@ -44,7 +44,11 @@ typedef struct _GstInterPipeListenerPriv GstInterPipeListenerPriv;
 struct _GstInterPipeListenerPriv
 {
   GstInterPipeIListener *listener;
-  const gchar *listen_to;
+  /* Owned copy of the node name this listener is attached to. Duplicated on
+   * store and freed on replace/remove so it never depends on the listener's
+   * own listen-to string staying alive (which a concurrent property set could
+   * free). */
+  gchar *listen_to;
 };
 
 /* Global mutexes for singletons */
@@ -81,7 +85,10 @@ gst_inter_pipe_get_nodes (void)
   static GHashTable *gst_inter_pipe_nodes = NULL;
 
   if (!gst_inter_pipe_nodes) {
-    gst_inter_pipe_nodes = g_hash_table_new (g_str_hash, g_str_equal);
+    /* Own the key strings so the table never depends on the node's name
+     * outliving its entry. */
+    gst_inter_pipe_nodes =
+        g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
   }
   return gst_inter_pipe_nodes;
 }
@@ -98,6 +105,10 @@ gst_inter_pipe_get_node (const gchar * node_name)
   nodes = gst_inter_pipe_get_nodes ();
 
   value = (GstInterPipeINode *) g_hash_table_lookup (nodes, node_name);
+  /* Return a strong reference taken under the lock so the node cannot be
+   * removed and finalized while a caller is still using it. */
+  if (value)
+    gst_object_ref (value);
   g_mutex_unlock (&nodes_mutex);
 
   return value;
@@ -111,6 +122,7 @@ gst_inter_pipe_listen_node (GstInterPipeIListener * listener,
   GstInterPipeListenerPriv *listener_priv;
   GHashTable *listeners;
   const gchar *listener_name;
+  gboolean priv_is_new = FALSE;
 
   g_return_val_if_fail (listener != NULL, FALSE);
   g_return_val_if_fail (node_name != NULL, FALSE);
@@ -135,6 +147,8 @@ gst_inter_pipe_listen_node (GstInterPipeIListener * listener,
   } else {
     listener_priv = g_malloc (sizeof (GstInterPipeListenerPriv));
     listener_priv->listener = listener;
+    listener_priv->listen_to = NULL;
+    priv_is_new = TRUE;
   }
 
   GST_INFO ("Adding new listener %s to node %s", listener_name, node_name);
@@ -145,11 +159,14 @@ gst_inter_pipe_listen_node (GstInterPipeIListener * listener,
      when it connects */
   if (node == NULL) {
     GST_INFO ("Node is not available yet, connecting later.");
+    g_free (listener_priv->listen_to);
     listener_priv->listen_to = NULL;
   } else {
     if (!gst_inter_pipe_inode_add_listener (node, listener))
       goto add_failed;
-    listener_priv->listen_to = node_name;
+    g_free (listener_priv->listen_to);
+    listener_priv->listen_to = g_strdup (node_name);
+    gst_object_unref (node);
   }
 
   g_hash_table_insert (listeners, (gchar *) listener_name,
@@ -168,6 +185,12 @@ add_failed:
   {
     GST_WARNING ("Could not add listener %s to node %s", listener_name,
         node_name);
+    /* We reach here only from the branch that holds a node reference. */
+    gst_object_unref (node);
+    /* A freshly allocated priv was never inserted into the table, so free it
+     * here. An existing priv is owned by the table and left in place. */
+    if (priv_is_new)
+      g_free (listener_priv);
     g_rec_mutex_unlock (&listeners_mutex);
     return FALSE;
   }
@@ -187,6 +210,7 @@ gst_inter_pipe_leave_listeners_table (GstInterPipeIListener * listener)
   if (!g_hash_table_remove (listeners, listener_name))
     return FALSE;
 
+  g_free (listener_priv->listen_to);
   g_free (listener_priv);
 
   return TRUE;
@@ -222,6 +246,7 @@ gst_inter_pipe_leave_node_priv (GstInterPipeIListener * listener)
     if (!gst_inter_pipe_inode_remove_listener (node, listener))
       goto remove_error;
 
+    gst_object_unref (node);
   }
 
   return TRUE;
@@ -235,6 +260,7 @@ no_node:
   {
     GST_WARNING ("Node %s not found. Could not leave node.",
         listener_priv->listen_to);
+    g_free (listener_priv->listen_to);
     listener_priv->listen_to = NULL;
     return FALSE;
   }
@@ -243,6 +269,8 @@ remove_error:
     GST_WARNING
         ("The listener %s was not listening to %s, there's something very wrong",
         listener_name, listener_priv->listen_to);
+    gst_object_unref (node);
+    g_free (listener_priv->listen_to);
     listener_priv->listen_to = NULL;
     return FALSE;
   }
@@ -305,7 +333,7 @@ gst_inter_pipe_add_node (GstInterPipeINode * node, const gchar * node_name)
 
   GST_INFO ("Adding node %s", node_name);
 
-  if (!g_hash_table_insert (nodes, (gchar *) node_name, (gpointer) node))
+  if (!g_hash_table_insert (nodes, g_strdup (node_name), (gpointer) node))
     goto add_error;
 
   g_mutex_unlock (&nodes_mutex);

@@ -79,6 +79,8 @@ static const gchar *gst_inter_pipe_src_get_name (GstInterPipeIListener *
     listener);
 static GstCaps *gst_inter_pipe_src_get_caps (GstInterPipeIListener * listener,
     gboolean * negotiated);
+static gboolean gst_inter_pipe_src_is_negotiated (GstInterPipeIListener *
+    listener);
 static gboolean gst_inter_pipe_src_set_caps (GstInterPipeIListener * listener,
     const GstCaps * caps);
 static gboolean gst_inter_pipe_src_node_added (GstInterPipeIListener * listener,
@@ -139,14 +141,21 @@ struct _GstInterPipeSrc
   /* Currently started and listening */
   gboolean listening;
 
-  /* Pending serial events queue */
+  /* Pending serial events queue, guarded by serial_events_lock because it is
+   * pushed from the node's streaming thread and drained from this element's. */
   GQueue *pending_serial_events;
+  GMutex serial_events_lock;
 
   /* Block switch */
   gboolean block_switch;
 
   /* Flag that allows initial negotiation */
   gboolean first_switch;
+
+  /* Whether caps have been set for the current attachment. Reset on every
+   * (re)attach so a node switch re-primes caps from the new node's first
+   * buffer. Backs gst_inter_pipe_src_is_negotiated. */
+  gboolean caps_primed;
 
   /* Allow caps renegotiation */
   gboolean allow_renegotiation;
@@ -241,9 +250,11 @@ gst_inter_pipe_src_init (GstInterPipeSrc * src)
   src->listen_to = NULL;
   src->listening = FALSE;
   src->pending_serial_events = g_queue_new ();
+  g_mutex_init (&src->serial_events_lock);
   src->block_switch = FALSE;
   src->allow_renegotiation = TRUE;
   src->first_switch = TRUE;
+  src->caps_primed = FALSE;
   src->stream_sync = GST_INTER_PIPE_SRC_PASSTHROUGH_TIMESTAMP;
   src->accept_events = TRUE;
   src->accept_eos_event = TRUE;
@@ -263,11 +274,23 @@ gst_inter_pipe_src_set_property (GObject * object, guint prop_id,
   listener = GST_INTER_PIPE_ILISTENER (src);
 
   switch (prop_id) {
-    case PROP_LISTEN_TO:
+    case PROP_LISTEN_TO:{
+      /* listen_to is read on the streaming thread (e.g. gst_inter_pipe_src_event,
+       * the node-notify callbacks); guard every read/write with the object lock,
+       * but never hold it across a listen/leave call (those take the global
+       * registry lock and the object lock is non-recursive). */
+      gchar *old_name;
+      gboolean same;
+
       node_name = g_strdup (g_value_get_string (value));
-      if (!g_strcmp0 (src->listen_to, node_name)) {
+
+      GST_OBJECT_LOCK (src);
+      same = (g_strcmp0 (src->listen_to, node_name) == 0);
+      GST_OBJECT_UNLOCK (src);
+
+      if (same) {
         /* We are already listening to that node, so nothing to do */
-        GST_INFO ("Already listening to node %s", node_name);
+        GST_INFO_OBJECT (src, "Already listening to node %s", node_name);
         g_free (node_name);
       } else if (node_name != NULL) {
         if (GST_BASE_SRC_IS_STARTED (GST_BASE_SRC (src))) {
@@ -276,34 +299,44 @@ gst_inter_pipe_src_set_property (GObject * object, guint prop_id,
             GST_ERROR_OBJECT (src, "Could not listen to node %s", node_name);
             g_free (node_name);
           } else {
-            if (src->listen_to) {
-              g_free (src->listen_to);
-            }
+            GST_OBJECT_LOCK (src);
+            old_name = src->listen_to;
             src->listen_to = node_name;
+            src->listening = TRUE;
+            GST_OBJECT_UNLOCK (src);
+            g_free (old_name);
+            GST_INFO_OBJECT (src, "Listening to node %s", node_name);
           }
-          src->listening = TRUE;
-          GST_INFO_OBJECT (src, "Listening to node %s", src->listen_to);
         } else {
           /* valid node_name, not started */
-          g_free (src->listen_to);
+          GST_OBJECT_LOCK (src);
+          old_name = src->listen_to;
           src->listen_to = node_name;
+          GST_OBJECT_UNLOCK (src);
+          g_free (old_name);
         }
       } else {
         if (src->listening) {
           /* NULL node name, currently listening */
           if (!gst_inter_pipe_leave_node (listener))
-            GST_WARNING_OBJECT (src, "Unable to remove listener from node %s",
-                src->listen_to);
-          g_free (src->listen_to);
+            GST_WARNING_OBJECT (src, "Unable to remove listener from node");
+          GST_OBJECT_LOCK (src);
+          old_name = src->listen_to;
           src->listen_to = NULL;
           src->listening = FALSE;
+          GST_OBJECT_UNLOCK (src);
+          g_free (old_name);
         } else {
           /* NULL node name, not listening/started */
-          g_free (src->listen_to);
+          GST_OBJECT_LOCK (src);
+          old_name = src->listen_to;
           src->listen_to = NULL;
+          GST_OBJECT_UNLOCK (src);
+          g_free (old_name);
         }
       }
       break;
+    }
     case PROP_BLOCK_SWITCH:
       src->block_switch = g_value_get_boolean (value);
       break;
@@ -340,7 +373,9 @@ gst_inter_pipe_src_get_property (GObject * object, guint prop_id,
 
   switch (prop_id) {
     case PROP_LISTEN_TO:
+      GST_OBJECT_LOCK (src);
       g_value_set_string (value, src->listen_to);
+      GST_OBJECT_UNLOCK (src);
       break;
     case PROP_BLOCK_SWITCH:
       g_value_set_boolean (value, src->block_switch);
@@ -374,6 +409,7 @@ gst_inter_pipe_src_finalize (GObject * object)
   /* Free pending serial events queue */
   g_queue_free_full (src->pending_serial_events,
       (GDestroyNotify) gst_event_unref);
+  g_mutex_clear (&src->serial_events_lock);
 
   if (src->listen_to) {
     g_free (src->listen_to);
@@ -390,6 +426,7 @@ gst_inter_pipe_src_start (GstBaseSrc * base)
 {
   GstBaseSrcClass *basesrc_class;
   GstInterPipeSrc *src;
+  gchar *listen_to;
 
   basesrc_class = GST_BASE_SRC_CLASS (gst_inter_pipe_src_parent_class);
   src = GST_INTER_PIPE_SRC (base);
@@ -397,21 +434,24 @@ gst_inter_pipe_src_start (GstBaseSrc * base)
   if (!basesrc_class->start (base))
     goto start_fail;
 
-  if (src->listen_to) {
-    if (!gst_inter_pipe_src_listen_node (src, src->listen_to)) {
-      GST_ERROR_OBJECT (src, "Could not listen to node %s", src->listen_to);
-      goto start_fail;
-    } else {
-      GST_INFO_OBJECT (src, "Listening to node %s", src->listen_to);
-      src->listening = TRUE;
-      goto start_done;
-    }
-  } else {
-    /* it's valid to be started but not listening (yet) */
-    goto start_done;
-  }
+  GST_OBJECT_LOCK (src);
+  listen_to = g_strdup (src->listen_to);
+  GST_OBJECT_UNLOCK (src);
 
-start_done:
+  if (listen_to) {
+    if (!gst_inter_pipe_src_listen_node (src, listen_to)) {
+      GST_ERROR_OBJECT (src, "Could not listen to node %s", listen_to);
+      g_free (listen_to);
+      goto start_fail;
+    }
+    GST_INFO_OBJECT (src, "Listening to node %s", listen_to);
+    GST_OBJECT_LOCK (src);
+    src->listening = TRUE;
+    GST_OBJECT_UNLOCK (src);
+  }
+  /* else: valid to be started but not listening (yet) */
+  g_free (listen_to);
+
   if (GST_INTER_PIPE_SRC_RESTART_TIMESTAMP == src->stream_sync)
     gst_base_src_set_do_timestamp (base, TRUE);
 
@@ -428,6 +468,8 @@ gst_inter_pipe_src_stop (GstBaseSrc * base)
   GstAppSrc *appsrc;
   GstInterPipeIListener *listener;
   gboolean blocking;
+  gboolean was_listening;
+  gchar *listen_to;
 
   basesrc_class = GST_BASE_SRC_CLASS (gst_inter_pipe_src_parent_class);
   src = GST_INTER_PIPE_SRC (base);
@@ -439,11 +481,27 @@ gst_inter_pipe_src_stop (GstBaseSrc * base)
     gst_app_src_end_of_stream(GST_APP_SRC(appsrc));
   }
 
-  if (src->listening) {
-    GST_INFO_OBJECT (src, "Removing listener from node %s", src->listen_to);
+  GST_OBJECT_LOCK (src);
+  was_listening = src->listening;
+  listen_to = g_strdup (src->listen_to);
+  GST_OBJECT_UNLOCK (src);
+
+  if (was_listening) {
+    GST_INFO_OBJECT (src, "Removing listener from node %s", listen_to);
     gst_inter_pipe_leave_node (listener);
+    GST_OBJECT_LOCK (src);
     src->listening = FALSE;
+    GST_OBJECT_UNLOCK (src);
   }
+  g_free (listen_to);
+
+  /* Drop the negotiated appsrc caps so a restart or reconnect renegotiates
+   * cleanly. Otherwise a stale caps set lingers and an
+   * allow-renegotiation=false listener refuses the producer's caps when it
+   * comes back; the next buffer re-establishes caps (see
+   * gst_inter_pipe_sink_push_to_listener). */
+  gst_app_src_set_caps (appsrc, NULL);
+  src->caps_primed = FALSE;
 
   return basesrc_class->stop (base);
 }
@@ -454,10 +512,20 @@ gst_inter_pipe_src_event (GstBaseSrc * base, GstEvent * event)
   GstBaseSrcClass *basesrc_class;
   GstInterPipeSrc *src;
   GstInterPipeINode *node;
+  gchar *listen_to;
 
   basesrc_class = GST_BASE_SRC_CLASS (gst_inter_pipe_src_parent_class);
   src = GST_INTER_PIPE_SRC (base);
-  node = gst_inter_pipe_get_node (src->listen_to);
+
+  /* Snapshot listen_to under the object lock: a concurrent property set may be
+   * freeing/replacing it, and gst_inter_pipe_get_node would otherwise read a
+   * dangling pointer. */
+  GST_OBJECT_LOCK (src);
+  listen_to = g_strdup (src->listen_to);
+  GST_OBJECT_UNLOCK (src);
+
+  node = listen_to ? gst_inter_pipe_get_node (listen_to) : NULL;
+  g_free (listen_to);
 
   if (GST_EVENT_IS_UPSTREAM (event)) {
 
@@ -469,6 +537,9 @@ gst_inter_pipe_src_event (GstBaseSrc * base, GstEvent * event)
     } else
       GST_WARNING_OBJECT (src, "Node doesn't exist, event won't be forwarded");
   }
+
+  if (node)
+    gst_object_unref (node);
 
   return basesrc_class->event (base, event);
 }
@@ -499,29 +570,35 @@ gst_inter_pipe_src_create (GstBaseSrc * base, guint64 offset, guint size,
       "Dequeue buffer %p with timestamp (PTS) %" GST_TIME_FORMAT, *buf,
       GST_TIME_ARGS (GST_BUFFER_PTS (*buf)));
 
+  /* Drain the head serial event if its timestamp has been reached. Decide and
+   * dequeue under the lock, but push the event downstream after releasing it so
+   * we never hold the lock across gst_pad_push_event. */
+  serial_event = NULL;
+  g_mutex_lock (&src->serial_events_lock);
   if (!g_queue_is_empty (src->pending_serial_events)) {
+    GstEvent *head = g_queue_peek_head (src->pending_serial_events);
     guint curr_bytes;
-    /*Pending Serial Events Queue */
-    serial_event = g_queue_peek_head (src->pending_serial_events);
 
     GST_DEBUG_OBJECT (src,
         "Got event with timestamp %" GST_TIME_FORMAT,
-        GST_TIME_ARGS (GST_EVENT_TIMESTAMP (serial_event)));
+        GST_TIME_ARGS (GST_EVENT_TIMESTAMP (head)));
 
     curr_bytes = gst_app_src_get_current_level_bytes (GST_APP_SRC (src));
-    if ((GST_EVENT_TIMESTAMP (serial_event) < GST_BUFFER_PTS (*buf))
+    if ((GST_EVENT_TIMESTAMP (head) < GST_BUFFER_PTS (*buf))
         || (curr_bytes == 0)) {
-
-      GST_DEBUG_OBJECT (src, "Sending Serial Event %s",
-          GST_EVENT_TYPE_NAME (serial_event));
-
       serial_event = g_queue_pop_head (src->pending_serial_events);
-      gst_pad_push_event (srcpad, serial_event);
     } else {
       GST_DEBUG_OBJECT (src, "Event %s timestamp is greater than the "
           "buffer timestamp, can't send serial event yet",
-          GST_EVENT_TYPE_NAME (serial_event));
+          GST_EVENT_TYPE_NAME (head));
     }
+  }
+  g_mutex_unlock (&src->serial_events_lock);
+
+  if (serial_event) {
+    GST_DEBUG_OBJECT (src, "Sending Serial Event %s",
+        GST_EVENT_TYPE_NAME (serial_event));
+    gst_pad_push_event (srcpad, serial_event);
   }
 
   return ret;
@@ -535,6 +612,7 @@ gst_inter_pipe_ilistener_init (GstInterPipeIListenerInterface * iface)
   iface->node_added = gst_inter_pipe_src_node_added;
   iface->node_removed = gst_inter_pipe_src_node_removed;
   iface->get_caps = gst_inter_pipe_src_get_caps;
+  iface->is_negotiated = gst_inter_pipe_src_is_negotiated;
   iface->set_caps = gst_inter_pipe_src_set_caps;
   iface->push_buffer = gst_inter_pipe_src_push_buffer;
   iface->push_event = gst_inter_pipe_src_push_event;
@@ -553,12 +631,17 @@ gst_inter_pipe_src_node_added (GstInterPipeIListener * iface,
     const gchar * node_name)
 {
   GstInterPipeSrc *src;
+  gboolean match;
 
   src = GST_INTER_PIPE_SRC (iface);
 
   GST_INFO_OBJECT (src, "Node %s registered. Listening.", node_name);
 
-  if (g_strcmp0 (src->listen_to, node_name) == 0) {
+  GST_OBJECT_LOCK (src);
+  match = (g_strcmp0 (src->listen_to, node_name) == 0);
+  GST_OBJECT_UNLOCK (src);
+
+  if (match) {
     gst_inter_pipe_src_listen_node (src, node_name);
   }
 
@@ -570,11 +653,17 @@ gst_inter_pipe_src_node_removed (GstInterPipeIListener * iface,
     const gchar * node_name)
 {
   GstInterPipeSrc *src;
+  gboolean match;
 
   src = GST_INTER_PIPE_SRC (iface);
 
   GST_INFO_OBJECT (src, "Node %s removed. Leaving.", node_name);
-  if (g_strcmp0 (src->listen_to, node_name) == 0) {
+
+  GST_OBJECT_LOCK (src);
+  match = (g_strcmp0 (src->listen_to, node_name) == 0);
+  GST_OBJECT_UNLOCK (src);
+
+  if (match) {
     gst_inter_pipe_leave_node (iface);
   }
 
@@ -604,7 +693,20 @@ gst_inter_pipe_src_get_caps (GstInterPipeIListener * iface,
   appcaps = gst_pad_peer_query_caps (GST_INTER_PIPE_SRC_PAD (src), NULL);
 
 out:
+  GST_DEBUG_OBJECT (src, "Reporting caps %" GST_PTR_FORMAT " (negotiated: %d)",
+      appcaps, *negotiated);
   return appcaps;
+}
+
+static gboolean
+gst_inter_pipe_src_is_negotiated (GstInterPipeIListener * iface)
+{
+  GstInterPipeSrc *src = GST_INTER_PIPE_SRC (iface);
+
+  /* Cheap, no downstream caps query: this is on the per-buffer path. The flag
+   * is cleared on every (re)attach (gst_inter_pipe_src_listen_node) and on stop
+   * so a node switch re-primes caps from the new node. */
+  return src->caps_primed;
 }
 
 static gboolean
@@ -622,10 +724,21 @@ gst_inter_pipe_src_set_caps (GstInterPipeIListener * iface,
   if (appcaps && !src->allow_renegotiation)
     goto allow_renegotiation_disabled;
 
+  GST_INFO_OBJECT (src, "Setting listener caps %" GST_PTR_FORMAT
+      " (previous: %" GST_PTR_FORMAT ")", caps, appcaps);
+
   if (appcaps)
     gst_caps_unref (appcaps);
 
   gst_app_src_set_caps (appsrc, caps);
+  src->caps_primed = TRUE;
+
+  /* On a cold attach the base source loop may have already negotiated an empty
+   * state before this node had any caps, so the caps arrive after the fact.
+   * Mark the source pad for reconfigure so the base source renegotiates with
+   * these caps before pushing the next buffer instead of failing downstream. */
+  gst_pad_mark_reconfigure (GST_INTER_PIPE_SRC_PAD (src));
+  GST_INFO_OBJECT (src, "Marked source pad for reconfigure after caps update");
 
   return TRUE;
 
@@ -674,21 +787,30 @@ gst_inter_pipe_src_push_buffer (GstInterPipeIListener * iface,
     if (GST_STATE (src) == GST_STATE_PLAYING) {
       if (srcbasetime > basetime) {
         difftime = srcbasetime - basetime;
-        if (GST_BUFFER_PTS (buffer) >= difftime) {
-          GST_BUFFER_PTS (buffer) = GST_BUFFER_PTS (buffer) - difftime;
-          if (GST_BUFFER_DTS (buffer) != GST_CLOCK_TIME_NONE ) {
-            GST_BUFFER_DTS (buffer) = GST_BUFFER_DTS (buffer) - difftime;
+        /* Shift timestamps back into this pipeline's running time. Only adjust
+         * valid timestamps, and guard each subtraction against underflow: a
+         * valid PTS smaller than the offset cannot be synchronized yet so the
+         * buffer is dropped, while DTS (which may be below PTS for reordered
+         * streams) is clamped to zero. */
+        if (GST_CLOCK_TIME_IS_VALID (GST_BUFFER_PTS (buffer))) {
+          if (GST_BUFFER_PTS (buffer) >= difftime) {
+            GST_BUFFER_PTS (buffer) = GST_BUFFER_PTS (buffer) - difftime;
+          } else {
+            gst_buffer_unref (buffer);
+            goto nosync;
           }
-        } else {
-          gst_buffer_unref (buffer);
-          goto nosync;
+        }
+        if (GST_CLOCK_TIME_IS_VALID (GST_BUFFER_DTS (buffer))) {
+          GST_BUFFER_DTS (buffer) =
+              (GST_BUFFER_DTS (buffer) >= difftime) ?
+              GST_BUFFER_DTS (buffer) - difftime : 0;
         }
       } else {
         difftime = basetime - srcbasetime;
-        GST_BUFFER_PTS (buffer) = GST_BUFFER_PTS (buffer) + difftime;
-        if (GST_BUFFER_DTS (buffer) != GST_CLOCK_TIME_NONE ) {
+        if (GST_CLOCK_TIME_IS_VALID (GST_BUFFER_PTS (buffer)))
+          GST_BUFFER_PTS (buffer) = GST_BUFFER_PTS (buffer) + difftime;
+        if (GST_CLOCK_TIME_IS_VALID (GST_BUFFER_DTS (buffer)))
           GST_BUFFER_DTS (buffer) = GST_BUFFER_DTS (buffer) + difftime;
-        }
       }
     } else {
       /* srcbasetime is only valid when PLAYING, no adjustment can be done */
@@ -724,7 +846,10 @@ out:
 
 nosync:
   {
-    GST_WARNING_OBJECT (src, "Buffers running time can not be synchronized yet"
+    /* DEBUG, not WARNING: this fires once per buffer while the element is not
+     * yet PLAYING (cold start / reconnect), which would otherwise flood the log
+     * at the frame rate. */
+    GST_DEBUG_OBJECT (src, "Buffers running time can not be synchronized yet"
         " with the interpipesrc running time");
     return FALSE;
   }
@@ -775,7 +900,9 @@ gst_inter_pipe_src_push_event (GstInterPipeIListener * iface, GstEvent * event,
         " enqueued on serial pending events", GST_EVENT_TYPE_NAME (event),
         GST_TIME_ARGS (GST_EVENT_TIMESTAMP (event)));
 
+    g_mutex_lock (&src->serial_events_lock);
     g_queue_push_tail (src->pending_serial_events, event);
+    g_mutex_unlock (&src->serial_events_lock);
   }
   return ret;
 no_events:
@@ -848,9 +975,23 @@ gst_inter_pipe_src_listen_node (GstInterPipeSrc * src, const gchar * node_name)
   if (src->first_switch)
     src->first_switch = FALSE;
 
+  /* New attachment: force caps to be re-primed from the new node's first
+   * buffer (the node may publish different caps than the previous one). */
+  src->caps_primed = FALSE;
+
   if (!gst_inter_pipe_listen_node (listener, node_name)) {
+    gchar *current;
+
     gst_inter_pipe_leave_node (listener);
-    gst_inter_pipe_listen_node (listener, src->listen_to);
+
+    /* Roll back to the previously configured node. Read listen_to under the
+     * object lock since a concurrent property set may be replacing it. */
+    GST_OBJECT_LOCK (src);
+    current = g_strdup (src->listen_to);
+    GST_OBJECT_UNLOCK (src);
+    if (current)
+      gst_inter_pipe_listen_node (listener, current);
+    g_free (current);
     return FALSE;
   } else {
     return TRUE;
