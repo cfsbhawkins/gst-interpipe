@@ -886,7 +886,9 @@ gst_inter_pipe_sink_push_to_listener (gpointer key, gpointer data,
   GST_LOG_OBJECT (sink, "Forwarding buffer %p to %s", buffer, listener_name);
 
   basetime = gst_element_get_base_time (GST_ELEMENT (sink));
-  gst_inter_pipe_ilistener_push_buffer (listener, buffer, basetime);
+  if (!gst_inter_pipe_ilistener_push_buffer (listener, buffer, basetime))
+    GST_DEBUG_OBJECT (sink, "Listener %s did not accept the buffer",
+        listener_name);
 }
 
 static void
@@ -1027,13 +1029,20 @@ gst_inter_pipe_sink_add_listener (GstInterPipeINode * iface,
 
   if (src_negotiated) {
     gboolean has_listeners;
+    gboolean has_negotiated_caps;
 
     if (!sinkcaps)
       goto add_to_list;
 
+    /* Snapshot the shared state under the lock so the negotiation decision is
+     * made on a consistent view. The lock is not held across the pad and caps
+     * calls below, which would risk re-entering this element's locks. */
+    g_mutex_lock (&sink->listeners_mutex);
     has_listeners = 0 != g_hash_table_size (listeners);
+    has_negotiated_caps = sink->caps_negotiated != NULL;
+    g_mutex_unlock (&sink->listeners_mutex);
 
-    if (!sink->caps_negotiated && !has_listeners
+    if (!has_negotiated_caps && !has_listeners
         && !gst_caps_is_equal (srccaps, sinkcaps)) {
 
       if (!gst_pad_push_event (GST_INTER_PIPE_SINK_PAD (sink),
@@ -1043,7 +1052,7 @@ gst_inter_pipe_sink_add_listener (GstInterPipeINode * iface,
       GST_INFO_OBJECT (sink, "Reconfigure event sent correctly");
     }
 
-    if (sink->caps_negotiated && has_listeners
+    if (has_negotiated_caps && has_listeners
         && !gst_caps_is_equal (srccaps, sinkcaps)) {
 
       if (!gst_inter_pipe_sink_are_caps_compatible (sink, srccaps, sinkcaps))
