@@ -872,8 +872,11 @@ gst_inter_pipe_sink_push_to_listener (gpointer key, gpointer data,
     gboolean negotiated = FALSE;
     GstCaps *listener_caps =
         gst_inter_pipe_ilistener_get_caps (listener, &negotiated);
-    if (!negotiated)
+    if (!negotiated) {
+      GST_INFO_OBJECT (sink, "Listener %s has no caps yet; applying node caps "
+          "%" GST_PTR_FORMAT " before its first buffer", listener_name, caps);
       gst_inter_pipe_ilistener_set_caps (listener, caps);
+    }
     if (listener_caps)
       gst_caps_unref (listener_caps);
   }

@@ -611,6 +611,8 @@ gst_inter_pipe_src_get_caps (GstInterPipeIListener * iface,
   appcaps = gst_pad_peer_query_caps (GST_INTER_PIPE_SRC_PAD (src), NULL);
 
 out:
+  GST_DEBUG_OBJECT (src, "Reporting caps %" GST_PTR_FORMAT " (negotiated: %d)",
+      appcaps, *negotiated);
   return appcaps;
 }
 
@@ -629,6 +631,9 @@ gst_inter_pipe_src_set_caps (GstInterPipeIListener * iface,
   if (appcaps && !src->allow_renegotiation)
     goto allow_renegotiation_disabled;
 
+  GST_INFO_OBJECT (src, "Setting listener caps %" GST_PTR_FORMAT
+      " (previous: %" GST_PTR_FORMAT ")", caps, appcaps);
+
   if (appcaps)
     gst_caps_unref (appcaps);
 
@@ -639,6 +644,7 @@ gst_inter_pipe_src_set_caps (GstInterPipeIListener * iface,
    * Mark the source pad for reconfigure so the base source renegotiates with
    * these caps before pushing the next buffer instead of failing downstream. */
   gst_pad_mark_reconfigure (GST_INTER_PIPE_SRC_PAD (src));
+  GST_INFO_OBJECT (src, "Marked source pad for reconfigure after caps update");
 
   return TRUE;
 
