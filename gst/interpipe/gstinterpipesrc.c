@@ -445,6 +445,13 @@ gst_inter_pipe_src_stop (GstBaseSrc * base)
     src->listening = FALSE;
   }
 
+  /* Drop the negotiated appsrc caps so a restart or reconnect renegotiates
+   * cleanly. Otherwise a stale caps set lingers and an
+   * allow-renegotiation=false listener refuses the producer's caps when it
+   * comes back; the next buffer re-establishes caps (see
+   * gst_inter_pipe_sink_push_to_listener). */
+  gst_app_src_set_caps (appsrc, NULL);
+
   return basesrc_class->stop (base);
 }
 
