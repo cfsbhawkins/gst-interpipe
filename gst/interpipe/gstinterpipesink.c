@@ -337,7 +337,7 @@ gst_inter_pipe_sink_update_listener_caps (gpointer key, gpointer data,
   caps = GST_CAPS (data_array[1]);
 
   listener = GST_INTER_PIPE_ILISTENER (data);
-  listener_name = (gchar *) key;
+  listener_name = (gchar *) gst_inter_pipe_ilistener_get_name (listener);
 
   GST_LOG_OBJECT (appsink, "Setting caps %" GST_PTR_FORMAT " to %s",
       caps, listener_name);
@@ -644,7 +644,7 @@ gst_inter_pipe_sink_forward_query_allocation (gpointer key, gpointer data,
   guint count, i, size, min;
 
   listener = GST_INTER_PIPE_ILISTENER (data);
-  listener_name = (gchar *) key;
+  listener_name = (gchar *) gst_inter_pipe_ilistener_get_name (listener);
   ctx = user_data;
   sink = ctx->sink;
 
@@ -861,7 +861,7 @@ gst_inter_pipe_sink_push_to_listener (gpointer key, gpointer data,
   caps = (GstCaps *) data_array[2];
 
   listener = GST_INTER_PIPE_ILISTENER (data);
-  listener_name = (gchar *) key;
+  listener_name = (gchar *) gst_inter_pipe_ilistener_get_name (listener);
 
   /* Guarantee caps reach the listener before its first buffer. A listener
    * that attached before this node had caps (e.g. a consumer pipeline started
@@ -965,7 +965,7 @@ gst_inter_pipe_sink_send_eos (gpointer key, gpointer data, gpointer user_data)
 
   sink = GST_INTER_PIPE_SINK (user_data);
   listener = GST_INTER_PIPE_ILISTENER (data);
-  listener_name = (gchar *) key;
+  listener_name = (gchar *) gst_inter_pipe_ilistener_get_name (listener);
 
   GST_LOG_OBJECT (sink, "Forwarding EOS to %s", listener_name);
 
@@ -1084,11 +1084,12 @@ gst_inter_pipe_sink_add_listener (GstInterPipeINode * iface,
 
 add_to_list:
   g_mutex_lock (&sink->listeners_mutex);
-  if (g_hash_table_contains (listeners, listener_name))
+  /* Key by the listener object: its pointer is stable for its lifetime,
+   * whereas its name pointer could change if the element were renamed. */
+  if (g_hash_table_contains (listeners, listener))
     goto already_registered;
 
-  g_hash_table_insert (listeners, (gpointer) listener_name,
-      (gpointer) listener);
+  g_hash_table_insert (listeners, (gpointer) listener, (gpointer) listener);
 
   g_mutex_unlock (&sink->listeners_mutex);
 
@@ -1145,7 +1146,7 @@ gst_inter_pipe_sink_remove_listener (GstInterPipeINode * iface,
 
   GST_INFO_OBJECT (sink, "Removing listener %s", listener_name);
 
-  if (!g_hash_table_remove (listeners, listener_name))
+  if (!g_hash_table_remove (listeners, listener))
     goto not_registered;
 
   if (0 == g_hash_table_size (listeners) && sink->caps_negotiated) {
