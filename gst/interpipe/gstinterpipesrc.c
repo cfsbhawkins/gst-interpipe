@@ -703,21 +703,30 @@ gst_inter_pipe_src_push_buffer (GstInterPipeIListener * iface,
     if (GST_STATE (src) == GST_STATE_PLAYING) {
       if (srcbasetime > basetime) {
         difftime = srcbasetime - basetime;
-        if (GST_BUFFER_PTS (buffer) >= difftime) {
-          GST_BUFFER_PTS (buffer) = GST_BUFFER_PTS (buffer) - difftime;
-          if (GST_BUFFER_DTS (buffer) != GST_CLOCK_TIME_NONE ) {
-            GST_BUFFER_DTS (buffer) = GST_BUFFER_DTS (buffer) - difftime;
+        /* Shift timestamps back into this pipeline's running time. Only adjust
+         * valid timestamps, and guard each subtraction against underflow: a
+         * valid PTS smaller than the offset cannot be synchronized yet so the
+         * buffer is dropped, while DTS (which may be below PTS for reordered
+         * streams) is clamped to zero. */
+        if (GST_CLOCK_TIME_IS_VALID (GST_BUFFER_PTS (buffer))) {
+          if (GST_BUFFER_PTS (buffer) >= difftime) {
+            GST_BUFFER_PTS (buffer) = GST_BUFFER_PTS (buffer) - difftime;
+          } else {
+            gst_buffer_unref (buffer);
+            goto nosync;
           }
-        } else {
-          gst_buffer_unref (buffer);
-          goto nosync;
+        }
+        if (GST_CLOCK_TIME_IS_VALID (GST_BUFFER_DTS (buffer))) {
+          GST_BUFFER_DTS (buffer) =
+              (GST_BUFFER_DTS (buffer) >= difftime) ?
+              GST_BUFFER_DTS (buffer) - difftime : 0;
         }
       } else {
         difftime = basetime - srcbasetime;
-        GST_BUFFER_PTS (buffer) = GST_BUFFER_PTS (buffer) + difftime;
-        if (GST_BUFFER_DTS (buffer) != GST_CLOCK_TIME_NONE ) {
+        if (GST_CLOCK_TIME_IS_VALID (GST_BUFFER_PTS (buffer)))
+          GST_BUFFER_PTS (buffer) = GST_BUFFER_PTS (buffer) + difftime;
+        if (GST_CLOCK_TIME_IS_VALID (GST_BUFFER_DTS (buffer)))
           GST_BUFFER_DTS (buffer) = GST_BUFFER_DTS (buffer) + difftime;
-        }
       }
     } else {
       /* srcbasetime is only valid when PLAYING, no adjustment can be done */
