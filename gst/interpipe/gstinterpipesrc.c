@@ -283,9 +283,9 @@ gst_inter_pipe_src_set_property (GObject * object, guint prop_id,
               g_free (src->listen_to);
             }
             src->listen_to = node_name;
+            src->listening = TRUE;
+            GST_INFO_OBJECT (src, "Listening to node %s", src->listen_to);
           }
-          src->listening = TRUE;
-          GST_INFO_OBJECT (src, "Listening to node %s", src->listen_to);
         } else {
           /* valid node_name, not started */
           g_free (src->listen_to);

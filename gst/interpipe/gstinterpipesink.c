@@ -784,8 +784,12 @@ gst_inter_pipe_sink_propose_allocation (GstBaseSink * base, GstQuery * query)
 
   g_hash_table_iter_init (&iter, listeners);
 
+  /* Aggregate every listener; if any listener cannot satisfy the allocation
+   * query, fail so the metas are dropped rather than claiming support the
+   * listener does not have. (ret |= would stay TRUE forever, leaving the
+   * failure handling below dead.) */
   while (g_hash_table_iter_next (&iter, &key, &value)) {
-    ret |= gst_inter_pipe_sink_forward_query_allocation (key, value, &ctx);
+    ret &= gst_inter_pipe_sink_forward_query_allocation (key, value, &ctx);
   }
 
   if (ret) {

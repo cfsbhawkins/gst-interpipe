@@ -111,6 +111,7 @@ gst_inter_pipe_listen_node (GstInterPipeIListener * listener,
   GstInterPipeListenerPriv *listener_priv;
   GHashTable *listeners;
   const gchar *listener_name;
+  gboolean priv_is_new = FALSE;
 
   g_return_val_if_fail (listener != NULL, FALSE);
   g_return_val_if_fail (node_name != NULL, FALSE);
@@ -135,6 +136,7 @@ gst_inter_pipe_listen_node (GstInterPipeIListener * listener,
   } else {
     listener_priv = g_malloc (sizeof (GstInterPipeListenerPriv));
     listener_priv->listener = listener;
+    priv_is_new = TRUE;
   }
 
   GST_INFO ("Adding new listener %s to node %s", listener_name, node_name);
@@ -168,6 +170,10 @@ add_failed:
   {
     GST_WARNING ("Could not add listener %s to node %s", listener_name,
         node_name);
+    /* A freshly allocated priv was never inserted into the table, so free it
+     * here. An existing priv is owned by the table and left in place. */
+    if (priv_is_new)
+      g_free (listener_priv);
     g_rec_mutex_unlock (&listeners_mutex);
     return FALSE;
   }
