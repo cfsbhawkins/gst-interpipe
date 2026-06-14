@@ -424,15 +424,16 @@ static GstCaps *
 gst_inter_pipe_sink_get_caps (GstBaseSink * base, GstCaps * filter)
 {
   GstInterPipeSink *sink;
-  GstInterPipeIListener *listener;
   GHashTable *listeners;
-  GstCaps *pre_filter;
-  GstCaps *intercept_caps;
-  GList *listeners_list = NULL;
-  GList *l = NULL;
+  GstCaps *intercept_caps = NULL;
+  GList *listeners_list;
+  GList *l;
 
   sink = GST_INTER_PIPE_SINK (base);
 
+  /* The listeners table and caps_negotiated are read and written under the
+   * lock for the whole negotiation; both are mutated concurrently by
+   * add/remove_listener and set_caps. */
   g_mutex_lock (&sink->listeners_mutex);
   listeners = GST_INTER_PIPE_SINK_LISTENERS (sink);
 
@@ -440,63 +441,60 @@ gst_inter_pipe_sink_get_caps (GstBaseSink * base, GstCaps * filter)
     GST_INFO_OBJECT (sink, "No listeners yet, accepting any caps");
     if (filter)
       filter = gst_caps_ref (filter);
-    goto nolisteners;
-  }
-
-  /* Find the intersection of all the listeners */
-  g_hash_table_foreach (listeners, gst_inter_pipe_sink_intersect_listener_caps,
-      sink);
-  g_mutex_unlock (&sink->listeners_mutex);
-
-  if (!sink->caps_negotiated || gst_caps_is_empty (sink->caps_negotiated)) {
-    GST_ERROR_OBJECT (sink,
-        "Failed to obtain an intersection between listener caps");
-    goto nointersection;
-  }
-
-  GST_INFO_OBJECT (sink, "Caps negotiated: %" GST_PTR_FORMAT,
-      sink->caps_negotiated);
-
-  /* Take into account upsream caps suggestion */
-  pre_filter = sink->caps_negotiated;
-  intercept_caps =
-      gst_inter_pipe_sink_caps_intersect (pre_filter, filter);
-
-  GST_INFO_OBJECT (sink, "Filtered caps: %" GST_PTR_FORMAT,
-      intercept_caps);
-
-  if (!intercept_caps || gst_caps_is_empty (intercept_caps)) {
-    GST_ERROR_OBJECT (sink,
-        "Failed to obtain an intersection between upstream elements and listeners");
-    goto nointersection;
-  }
-
-  return intercept_caps;
-
-nolisteners:
-  {
     g_mutex_unlock (&sink->listeners_mutex);
     return filter;
   }
 
-nointersection:
-  {
-    listeners_list = g_hash_table_get_values (listeners);
-    if (listeners_list) {
-      for (l = listeners_list; l != NULL; l = l->next) {
-        listener = l->data;
-        if (!gst_inter_pipe_leave_node (listener))
-          GST_WARNING_OBJECT (listener, "Unable to remove listener from node");
-      }
-    }
-    g_list_free (listeners_list);
+  /* Intersect the caps of every listener into sink->caps_negotiated. */
+  g_hash_table_foreach (listeners, gst_inter_pipe_sink_intersect_listener_caps,
+      sink);
 
-    if (sink->caps_negotiated)
-      gst_caps_unref (sink->caps_negotiated);
-
-    sink->caps_negotiated = NULL;
-    return NULL;
+  if (sink->caps_negotiated && !gst_caps_is_empty (sink->caps_negotiated)) {
+    GST_INFO_OBJECT (sink, "Caps negotiated: %" GST_PTR_FORMAT,
+        sink->caps_negotiated);
+    /* Take into account the upstream caps suggestion. */
+    intercept_caps =
+        gst_inter_pipe_sink_caps_intersect (sink->caps_negotiated, filter);
+    GST_INFO_OBJECT (sink, "Filtered caps: %" GST_PTR_FORMAT, intercept_caps);
+  } else {
+    GST_ERROR_OBJECT (sink,
+        "Failed to obtain an intersection between listener caps");
   }
+
+  if (intercept_caps && !gst_caps_is_empty (intercept_caps)) {
+    g_mutex_unlock (&sink->listeners_mutex);
+    return intercept_caps;
+  }
+
+  if (intercept_caps) {
+    GST_ERROR_OBJECT (sink, "Failed to obtain an intersection between "
+        "upstream elements and listeners");
+    gst_caps_unref (intercept_caps);
+  }
+
+  /* No usable intersection: detach every listener and reset the negotiated
+   * caps. Snapshot the listeners holding a ref each, drop the lock, then call
+   * leave_node, which re-enters this element through remove_listener and would
+   * deadlock if called under the lock. */
+  listeners_list = g_hash_table_get_values (listeners);
+  for (l = listeners_list; l != NULL; l = l->next)
+    gst_object_ref (l->data);
+
+  if (sink->caps_negotiated) {
+    gst_caps_unref (sink->caps_negotiated);
+    sink->caps_negotiated = NULL;
+  }
+  g_mutex_unlock (&sink->listeners_mutex);
+
+  for (l = listeners_list; l != NULL; l = l->next) {
+    GstInterPipeIListener *listener = l->data;
+    if (!gst_inter_pipe_leave_node (listener))
+      GST_WARNING_OBJECT (listener, "Unable to remove listener from node");
+    gst_object_unref (listener);
+  }
+  g_list_free (listeners_list);
+
+  return NULL;
 }
 
 static gboolean
