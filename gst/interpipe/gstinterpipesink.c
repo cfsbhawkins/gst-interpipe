@@ -350,19 +350,21 @@ static gboolean
 gst_inter_pipe_sink_are_caps_compatible (GstInterPipeSink * sink,
     GstCaps * listener_caps, GstCaps * sinkcaps)
 {
-  GstCaps *renegotiated_caps = NULL;
+  GstCaps *renegotiated_caps;
+  gboolean compatible = TRUE;
 
   renegotiated_caps = gst_caps_intersect (listener_caps, sinkcaps);
 
   if (gst_caps_is_empty (renegotiated_caps)) {
     GST_ERROR_OBJECT (sink, "No caps intersection between listener and sink");
-    return FALSE;
+    compatible = FALSE;
+  } else {
+    GST_INFO_OBJECT (sink, "Renegotiated caps: %" GST_PTR_FORMAT,
+        renegotiated_caps);
   }
 
-  GST_INFO_OBJECT (sink, "Renegotiated caps: %" GST_PTR_FORMAT,
-      renegotiated_caps);
-
-  return TRUE;
+  gst_caps_unref (renegotiated_caps);
+  return compatible;
 }
 
 static GstCaps *
@@ -412,7 +414,10 @@ gst_inter_pipe_sink_intersect_listener_caps (gpointer key, gpointer value,
   }
 
   sink->caps_negotiated = caps_intersection;
-  gst_caps_unref (caps_listener);
+  /* get_caps may legitimately return NULL (e.g. a peer caps query yielding
+   * nothing while renegotiation is allowed). */
+  if (caps_listener)
+    gst_caps_unref (caps_listener);
 }
 
 static GstCaps *
@@ -504,18 +509,24 @@ gst_inter_pipe_sink_set_caps (GstBaseSink * base, GstCaps * caps)
   sink = GST_INTER_PIPE_SINK (base);
   listeners = GST_INTER_PIPE_SINK_LISTENERS (sink);
 
-  GST_BASE_SINK_CLASS (gst_inter_pipe_sink_parent_class)->set_caps (base, caps);
+  if (!GST_BASE_SINK_CLASS (gst_inter_pipe_sink_parent_class)->set_caps (base,
+          caps)) {
+    GST_WARNING_OBJECT (sink, "Parent rejected caps %" GST_PTR_FORMAT, caps);
+    return FALSE;
+  }
 
   GST_INFO_OBJECT (sink, "Incoming Caps: %" GST_PTR_FORMAT, caps);
   GST_INFO_OBJECT (sink, "Negotiated Caps: %" GST_PTR_FORMAT,
       sink->caps_negotiated);
 
-  /* No one is listening to me I can accept caps */
+  g_mutex_lock (&sink->listeners_mutex);
+  /* No one is listening to me, I can accept caps. Checked under the lock so it
+   * cannot race a listener being added concurrently. */
   if (0 == g_hash_table_size (listeners)) {
+    g_mutex_unlock (&sink->listeners_mutex);
     goto out;
   }
 
-  g_mutex_lock (&sink->listeners_mutex);
   if (sink->caps_negotiated
       && (gst_caps_can_intersect (sink->caps_negotiated, caps))) {
     gpointer data[2];
@@ -884,6 +895,12 @@ gst_inter_pipe_sink_process_sample (GstInterPipeSink * sink, GstSample * sample)
   listeners = GST_INTER_PIPE_SINK_LISTENERS (sink);
 
   buffer = gst_sample_get_buffer (sample);
+  if (!buffer) {
+    GST_LOG_OBJECT (sink, "Sample carries no buffer, nothing to forward");
+    gst_sample_unref (sample);
+    g_mutex_unlock (&sink->listeners_mutex);
+    return;
+  }
 
   /* Update last_buffer_timestamp */
   sink->last_buffer_timestamp = GST_BUFFER_PTS (buffer);
