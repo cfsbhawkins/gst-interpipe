@@ -5,6 +5,7 @@ core_tests = [
   [ 'gst/test_block_switch.c' ],
   [ 'gst/test_caps_renegotiation.c' ],
   [ 'gst/test_cold_attach.c' ],
+  [ 'gst/test_force_key_unit_event.c' ],
   [ 'gst/test_stream_sync.c' ],
   [ 'gst/test_get_caps.c' ],
   [ 'gst/test_hot_plug.c' ],

@@ -73,7 +73,11 @@ gst_inter_pipe_get_listeners (void)
   static GHashTable *gst_inter_pipe_listeners = NULL;
 
   if (!gst_inter_pipe_listeners) {
-    gst_inter_pipe_listeners = g_hash_table_new (g_str_hash, g_str_equal);
+    /* Own the key strings so the table never depends on the listener's name
+     * pointer (GST_OBJECT_NAME) staying alive: a rename frees the old name
+     * buffer, which would otherwise leave a dangling key. */
+    gst_inter_pipe_listeners =
+        g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
   }
   return gst_inter_pipe_listeners;
 }
@@ -169,7 +173,10 @@ gst_inter_pipe_listen_node (GstInterPipeIListener * listener,
     gst_object_unref (node);
   }
 
-  g_hash_table_insert (listeners, (gchar *) listener_name,
+  /* The table owns a duplicated key (freed by its key-destroy func). On a
+   * re-insert with an existing key g_hash_table_insert frees the passed
+   * duplicate and keeps the original, so this never leaks. */
+  g_hash_table_insert (listeners, g_strdup (listener_name),
       (gpointer) listener_priv);
 
   g_rec_mutex_unlock (&listeners_mutex);

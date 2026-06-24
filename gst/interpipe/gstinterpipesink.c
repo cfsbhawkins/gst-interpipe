@@ -1183,11 +1183,34 @@ gst_inter_pipe_sink_receive_event (GstInterPipeINode * iface, GstEvent * event)
   GstInterPipeSink *self;
   GHashTable *listeners;
   GstPad *sinkpad;
+  const GstStructure *structure;
+  gboolean is_force_key_unit;
+  guint num_listeners;
 
   self = GST_INTER_PIPE_SINK (iface);
   listeners = GST_INTER_PIPE_SINK_LISTENERS (self);
 
-  if (g_hash_table_size (listeners) != 1) {
+  /* A force-key-unit request is safe to broadcast to the producer even when
+   * several listeners share this node: the producer simply emits an extra
+   * keyframe, which is delivered to every listener for a small bitrate cost.
+   * This lets a freshly attached consumer (e.g. a preview leg) obtain a
+   * keyframe immediately instead of waiting for the next periodic one, which
+   * it may miss entirely while it is still starting up. Every other upstream
+   * event stays confined to the single-listener case so that one consumer
+   * cannot disturb the others. */
+  structure = gst_event_get_structure (event);
+  is_force_key_unit = GST_EVENT_TYPE (event) == GST_EVENT_CUSTOM_UPSTREAM
+      && structure != NULL
+      && gst_structure_has_name (structure, "GstForceKeyUnit");
+
+  /* Snapshot the listener count under the lock (add/remove_listener mutate the
+   * table from other threads), but release it before pushing the event so the
+   * lock is never held across gst_pad_push_event. */
+  g_mutex_lock (&self->listeners_mutex);
+  num_listeners = g_hash_table_size (listeners);
+  g_mutex_unlock (&self->listeners_mutex);
+
+  if (num_listeners != 1 && !is_force_key_unit) {
     gst_event_unref (event);
     goto multiple_listeners;
   }

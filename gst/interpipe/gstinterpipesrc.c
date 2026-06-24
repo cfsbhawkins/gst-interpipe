@@ -577,7 +577,7 @@ gst_inter_pipe_src_create (GstBaseSrc * base, guint64 offset, guint size,
   g_mutex_lock (&src->serial_events_lock);
   if (!g_queue_is_empty (src->pending_serial_events)) {
     GstEvent *head = g_queue_peek_head (src->pending_serial_events);
-    guint curr_bytes;
+    guint64 curr_bytes;
 
     GST_DEBUG_OBJECT (src,
         "Got event with timestamp %" GST_TIME_FORMAT,
