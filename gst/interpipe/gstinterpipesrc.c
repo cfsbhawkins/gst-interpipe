@@ -98,6 +98,7 @@ static gboolean gst_inter_pipe_src_listen_node (GstInterPipeSrc * src,
     const gchar * node_name);
 static gboolean gst_inter_pipe_src_start (GstBaseSrc * base);
 static gboolean gst_inter_pipe_src_stop (GstBaseSrc * base);
+static gboolean gst_inter_pipe_src_negotiate (GstBaseSrc * base);
 static gboolean gst_inter_pipe_src_event (GstBaseSrc * base, GstEvent * event);
 static void gst_inter_pipe_ilistener_init (GstInterPipeIListenerInterface *
     iface);
@@ -238,6 +239,7 @@ gst_inter_pipe_src_class_init (GstInterPipeSrcClass * klass)
 
   basesrc_class->start = GST_DEBUG_FUNCPTR (gst_inter_pipe_src_start);
   basesrc_class->stop = GST_DEBUG_FUNCPTR (gst_inter_pipe_src_stop);
+  basesrc_class->negotiate = GST_DEBUG_FUNCPTR (gst_inter_pipe_src_negotiate);
   basesrc_class->event = GST_DEBUG_FUNCPTR (gst_inter_pipe_src_event);
   basesrc_class->create = GST_DEBUG_FUNCPTR (gst_inter_pipe_src_create);
 }
@@ -504,6 +506,33 @@ gst_inter_pipe_src_stop (GstBaseSrc * base)
   src->caps_primed = FALSE;
 
   return basesrc_class->stop (base);
+}
+
+/* Defer negotiation until the producer's caps have been primed onto this
+ * listener (gst_inter_pipe_src_set_caps sets caps_primed and marks the source
+ * pad for reconfigure). On a cold attach to an already-running producer, the
+ * base source's create loop can run negotiate() before those caps have
+ * propagated; the default basesrc negotiate would then query the (unprimed)
+ * downstream and, when a consumer element advertises an unfixated field — e.g.
+ * a videocrop offering a width/height range — fail to fixate and post
+ * not-negotiated, killing the leg even though the producer is delivering fixed
+ * caps. Returning TRUE here without forcing caps lets the loop proceed; appsrc
+ * blocks for the first buffer, by which time set_caps() has primed the caps and
+ * the marked reconfigure drives a real negotiation that fixates correctly. */
+static gboolean
+gst_inter_pipe_src_negotiate (GstBaseSrc * base)
+{
+  GstInterPipeSrc *src = GST_INTER_PIPE_SRC (base);
+
+  if (!src->caps_primed) {
+    GST_DEBUG_OBJECT (src,
+        "Caps not primed yet; deferring negotiation until the producer caps "
+        "arrive (avoids not-negotiated against an unfixated downstream on cold "
+        "attach)");
+    return TRUE;
+  }
+
+  return GST_BASE_SRC_CLASS (gst_inter_pipe_src_parent_class)->negotiate (base);
 }
 
 static gboolean

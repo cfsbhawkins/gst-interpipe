@@ -82,6 +82,16 @@ gst_inter_pipe_get_listeners (void)
   return gst_inter_pipe_listeners;
 }
 
+/* Value-destroy for the nodes table: clear and free the GWeakRef box. */
+static void
+gst_inter_pipe_node_weak_ref_free (gpointer data)
+{
+  GWeakRef *weak = (GWeakRef *) data;
+
+  g_weak_ref_clear (weak);
+  g_free (weak);
+}
+
 static GHashTable *
 gst_inter_pipe_get_nodes (void)
 {
@@ -90,9 +100,12 @@ gst_inter_pipe_get_nodes (void)
 
   if (!gst_inter_pipe_nodes) {
     /* Own the key strings so the table never depends on the node's name
-     * outliving its entry. */
+     * outliving its entry. Values are GWeakRef boxes (not borrowed strong
+     * pointers) so a lookup can never resurrect a finalizing node — see
+     * gst_inter_pipe_get_node. */
     gst_inter_pipe_nodes =
-        g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+        g_hash_table_new_full (g_str_hash, g_str_equal, g_free,
+        gst_inter_pipe_node_weak_ref_free);
   }
   return gst_inter_pipe_nodes;
 }
@@ -101,18 +114,24 @@ GstInterPipeINode *
 gst_inter_pipe_get_node (const gchar * node_name)
 {
   GHashTable *nodes;
-  GstInterPipeINode *value;
+  GWeakRef *weak;
+  GstInterPipeINode *value = NULL;
 
   g_return_val_if_fail (node_name != NULL, NULL);
 
   g_mutex_lock (&nodes_mutex);
   nodes = gst_inter_pipe_get_nodes ();
 
-  value = (GstInterPipeINode *) g_hash_table_lookup (nodes, node_name);
-  /* Return a strong reference taken under the lock so the node cannot be
-   * removed and finalized while a caller is still using it. */
-  if (value)
-    gst_object_ref (value);
+  /* The table holds a GWeakRef, not a borrowed strong pointer. g_weak_ref_get
+   * atomically returns a new strong reference, or NULL if the node has already
+   * reached refcount 0 / is being finalized. A plain gst_object_ref on a
+   * borrowed pointer could instead *resurrect* a node that gstd is concurrently
+   * tearing down (refcount 0 -> 1 -> 0 = double finalize), after which gstd's
+   * own set_state/bin_remove would operate on freed memory and trip the
+   * GST_IS_ELEMENT cast assertions. */
+  weak = (GWeakRef *) g_hash_table_lookup (nodes, node_name);
+  if (weak)
+    value = (GstInterPipeINode *) g_weak_ref_get (weak);
   g_mutex_unlock (&nodes_mutex);
 
   return value;
@@ -340,8 +359,21 @@ gst_inter_pipe_add_node (GstInterPipeINode * node, const gchar * node_name)
 
   GST_INFO ("Adding node %s", node_name);
 
-  if (!g_hash_table_insert (nodes, g_strdup (node_name), (gpointer) node))
-    goto add_error;
+  {
+    /* Store a GWeakRef box rather than a borrowed strong pointer, so a
+     * concurrent gst_inter_pipe_get_node can never resurrect this node while
+     * it is being finalized. The table still does not keep the node alive.
+     *
+     * The g_hash_table_contains check above (under the same lock) guarantees a
+     * unique key, so g_hash_table_insert always returns TRUE and takes
+     * ownership of the box via the value-destroy func. We deliberately don't
+     * clean up on a FALSE return: that would mean the key already existed, in
+     * which case GLib has already inserted this box as the value and destroyed
+     * the old one, so freeing it here would leave a dangling pointer behind. */
+    GWeakRef *weak = g_new0 (GWeakRef, 1);
+    g_weak_ref_init (weak, node);
+    g_hash_table_insert (nodes, g_strdup (node_name), (gpointer) weak);
+  }
 
   g_mutex_unlock (&nodes_mutex);
 
@@ -356,12 +388,6 @@ gst_inter_pipe_add_node (GstInterPipeINode * node, const gchar * node_name)
 no_unique:
   {
     GST_WARNING ("Could not add node %s, it is not unique.", node_name);
-    g_mutex_unlock (&nodes_mutex);
-    return FALSE;
-  }
-add_error:
-  {
-    GST_INFO ("Could not add node %s", node_name);
     g_mutex_unlock (&nodes_mutex);
     return FALSE;
   }
