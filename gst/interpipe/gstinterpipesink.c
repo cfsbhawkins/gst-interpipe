@@ -1181,66 +1181,57 @@ static gboolean
 gst_inter_pipe_sink_receive_event (GstInterPipeINode * iface, GstEvent * event)
 {
   GstInterPipeSink *self;
-  GHashTable *listeners;
   GstPad *sinkpad;
   const GstStructure *structure;
   gboolean is_force_key_unit;
-  guint num_listeners;
 
   self = GST_INTER_PIPE_SINK (iface);
-  listeners = GST_INTER_PIPE_SINK_LISTENERS (self);
 
-  /* A force-key-unit request is safe to broadcast to the producer even when
+  /* Forward ONLY application-level custom events across the node boundary —
+   * today that is the force-key-unit request. Every non-custom upstream event
+   * type is a statement about the CONSUMER pipeline's clocks, caps, or
+   * playback position, none of which translate across an interpipe boundary
+   * whose caps are frozen and whose buffer timestamps are rebased per
+   * listener:
+   *
+   * - RECONFIGURE asks the producer to renegotiate caps it cannot change
+   *   (listeners attach with a fixed negotiated caps contract), and a sink
+   *   that emits it while linking its internal pads (rtspclientsink during
+   *   RTSP session setup) deadlocked the producer's source in its allocation
+   *   query, freezing the shared producer for every consumer.
+   * - QOS carries running-time measured against the consumer's clock, which
+   *   the producer does not share (buffers are rebased by stream-sync, but
+   *   this path pushes events raw), so it is garbage timing feedback.
+   * - SEEK would flush and reposition a producer shared by every listener.
+   * - LATENCY distributes a value computed for the consumer's graph; applied
+   *   to the producer's sinks it adds a delay belonging to a different
+   *   pipeline.
+   * - NAVIGATION/STEP and the rest have no upstream consumer here.
+   *
+   * A force-key-unit request, by contrast, is about stream CONTENT, which is
+   * the one thing both sides share — and it is safe to broadcast even when
    * several listeners share this node: the producer simply emits an extra
-   * keyframe, which is delivered to every listener for a small bitrate cost.
-   * This lets a freshly attached consumer (e.g. a preview leg) obtain a
-   * keyframe immediately instead of waiting for the next periodic one, which
-   * it may miss entirely while it is still starting up. Every other upstream
-   * event stays confined to the single-listener case so that one consumer
-   * cannot disturb the others. */
+   * keyframe, delivered to every listener for a small bitrate cost. This
+   * lets a freshly attached consumer (e.g. a preview leg) obtain a keyframe
+   * immediately instead of waiting for the next periodic one, which it may
+   * miss entirely while it is still starting up.
+   *
+   * Dropped events report success: to the sender every upstream event is
+   * advisory, and a FALSE here would surface as a spurious pad-push failure
+   * inside the consumer's sink. */
   structure = gst_event_get_structure (event);
   is_force_key_unit = GST_EVENT_TYPE (event) == GST_EVENT_CUSTOM_UPSTREAM
       && structure != NULL
       && gst_structure_has_name (structure, "GstForceKeyUnit");
 
-  /* Never forward RECONFIGURE across the node boundary. A reconfigure asks
-   * the producer to renegotiate caps, but an interpipe consumer cannot accept
-   * new caps across the boundary (listeners attach with a fixed negotiated
-   * caps contract), so the renegotiation can never produce a different
-   * result. Worse, it is actively destructive: a sink that emits reconfigure
-   * while linking its internal pads (e.g. rtspclientsink during RTSP session
-   * setup) sends it through the consumer leg into the producer pipeline,
-   * whose source then renegotiates against a frozen boundary and can block
-   * forever in its allocation query, freezing the shared producer for every
-   * consumer. Swallow it and report success: from the sender's perspective a
-   * reconfigure is advisory. */
-  if (GST_EVENT_TYPE (event) == GST_EVENT_RECONFIGURE) {
+  if (!is_force_key_unit) {
     GST_DEBUG_OBJECT (self,
-        "Dropping reconfigure event: caps are frozen across the interpipe "
-        "boundary, forwarding it would only disturb the producer");
+        "Dropping upstream %s event: only force-key-unit crosses the "
+        "interpipe boundary", GST_EVENT_TYPE_NAME (event));
     gst_event_unref (event);
     return TRUE;
   }
 
-  /* Snapshot the listener count under the lock (add/remove_listener mutate the
-   * table from other threads), but release it before pushing the event so the
-   * lock is never held across gst_pad_push_event. */
-  g_mutex_lock (&self->listeners_mutex);
-  num_listeners = g_hash_table_size (listeners);
-  g_mutex_unlock (&self->listeners_mutex);
-
-  if (num_listeners != 1 && !is_force_key_unit) {
-    gst_event_unref (event);
-    goto multiple_listeners;
-  }
-
   sinkpad = GST_INTER_PIPE_SINK_PAD (self);
   return gst_pad_push_event (sinkpad, event);
-
-multiple_listeners:
-  {
-    GST_WARNING_OBJECT (self, "Could not send event upstream, "
-        "more than one listener is connected");
-    return FALSE;
-  }
 }
