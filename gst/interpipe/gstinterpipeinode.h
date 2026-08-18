@@ -54,9 +54,11 @@ typedef struct _GstInterPipeINodeInterface GstInterPipeINodeInterface;
  * #gst_inter_pipe_inode_remove_listener.
  *
  * @receive_event: Receive the upstream #GstEvent passed through
- * @event and forward it upstream. It is responsability of the node to
- * decide if the event can be forwarded or not. See
- * #gst_inter_pipe_inode_receive_event.
+ * @event. It is responsability of the node to decide if the event can
+ * be forwarded or not: only the force-key-unit custom event is pushed
+ * upstream (regardless of listener count); every other upstream event
+ * type is pipeline-local (clocks, caps, playback position) and is
+ * dropped with a TRUE return. See #gst_inter_pipe_inode_receive_event.
  */
 struct _GstInterPipeINodeInterface
 {
