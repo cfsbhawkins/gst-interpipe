@@ -1203,6 +1203,25 @@ gst_inter_pipe_sink_receive_event (GstInterPipeINode * iface, GstEvent * event)
       && structure != NULL
       && gst_structure_has_name (structure, "GstForceKeyUnit");
 
+  /* Never forward RECONFIGURE across the node boundary. A reconfigure asks
+   * the producer to renegotiate caps, but an interpipe consumer cannot accept
+   * new caps across the boundary (listeners attach with a fixed negotiated
+   * caps contract), so the renegotiation can never produce a different
+   * result. Worse, it is actively destructive: a sink that emits reconfigure
+   * while linking its internal pads (e.g. rtspclientsink during RTSP session
+   * setup) sends it through the consumer leg into the producer pipeline,
+   * whose source then renegotiates against a frozen boundary and can block
+   * forever in its allocation query, freezing the shared producer for every
+   * consumer. Swallow it and report success: from the sender's perspective a
+   * reconfigure is advisory. */
+  if (GST_EVENT_TYPE (event) == GST_EVENT_RECONFIGURE) {
+    GST_DEBUG_OBJECT (self,
+        "Dropping reconfigure event: caps are frozen across the interpipe "
+        "boundary, forwarding it would only disturb the producer");
+    gst_event_unref (event);
+    return TRUE;
+  }
+
   /* Snapshot the listener count under the lock (add/remove_listener mutate the
    * table from other threads), but release it before pushing the event so the
    * lock is never held across gst_pad_push_event. */
