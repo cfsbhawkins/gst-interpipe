@@ -1187,38 +1187,16 @@ gst_inter_pipe_sink_receive_event (GstInterPipeINode * iface, GstEvent * event)
 
   self = GST_INTER_PIPE_SINK (iface);
 
-  /* Forward ONLY application-level custom events across the node boundary —
-   * today that is the force-key-unit request. Every non-custom upstream event
-   * type is a statement about the CONSUMER pipeline's clocks, caps, or
-   * playback position, none of which translate across an interpipe boundary
-   * whose caps are frozen and whose buffer timestamps are rebased per
-   * listener:
-   *
-   * - RECONFIGURE asks the producer to renegotiate caps it cannot change
-   *   (listeners attach with a fixed negotiated caps contract), and a sink
-   *   that emits it while linking its internal pads (rtspclientsink during
-   *   RTSP session setup) deadlocked the producer's source in its allocation
-   *   query, freezing the shared producer for every consumer.
-   * - QOS carries running-time measured against the consumer's clock, which
-   *   the producer does not share (buffers are rebased by stream-sync, but
-   *   this path pushes events raw), so it is garbage timing feedback.
-   * - SEEK would flush and reposition a producer shared by every listener.
-   * - LATENCY distributes a value computed for the consumer's graph; applied
-   *   to the producer's sinks it adds a delay belonging to a different
-   *   pipeline.
-   * - NAVIGATION/STEP and the rest have no upstream consumer here.
-   *
-   * A force-key-unit request, by contrast, is about stream CONTENT, which is
-   * the one thing both sides share — and it is safe to broadcast even when
-   * several listeners share this node: the producer simply emits an extra
-   * keyframe, delivered to every listener for a small bitrate cost. This
-   * lets a freshly attached consumer (e.g. a preview leg) obtain a keyframe
-   * immediately instead of waiting for the next periodic one, which it may
-   * miss entirely while it is still starting up.
-   *
-   * Dropped events report success: to the sender every upstream event is
-   * advisory, and a FALSE here would surface as a spurious pad-push failure
-   * inside the consumer's sink. */
+  /* Only the force-key-unit request crosses the node boundary: it is about
+   * stream content, which producer and consumers share, and broadcasting it
+   * is safe with any listener count (an extra keyframe costs a little
+   * bitrate and unblocks a freshly attached consumer). Every other upstream
+   * event type is pipeline-local — clocks (QOS, LATENCY), caps
+   * (RECONFIGURE), or playback position (SEEK) — and does not translate
+   * across a boundary whose caps are frozen and whose buffer timestamps are
+   * rebased per listener; a consumer-originated RECONFIGURE in particular
+   * has deadlocked the producer's source in renegotiation. Dropped events
+   * return TRUE: the node has accepted and consumed them. */
   structure = gst_event_get_structure (event);
   is_force_key_unit = GST_EVENT_TYPE (event) == GST_EVENT_CUSTOM_UPSTREAM
       && structure != NULL
