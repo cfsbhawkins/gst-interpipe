@@ -41,6 +41,7 @@ check_PROGRAMS = gst/test_allow_renegotiation_property \
                  gst/test_preroll_forwarding \
                  gst/test_producer_latency \
                  gst/test_reconfigure_event \
+                 gst/test_serial_event_order \
                  gst/test_set_caps
 
 TESTS = $(check_PROGRAMS)

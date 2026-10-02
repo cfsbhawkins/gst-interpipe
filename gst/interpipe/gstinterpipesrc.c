@@ -140,6 +140,14 @@ gst_inter_pipe_src_stream_sync_get_type (void)
   return inter_pipe_src_stream_sync_type;
 }
 
+/* A serial event from the node, and how many buffers this element had queued
+ * when it arrived: it is due once that many buffers have been taken. */
+typedef struct
+{
+  GstEvent *event;
+  guint64 after;
+} GstInterPipeSrcSerialEvent;
+
 struct _GstInterPipeSrc
 {
   GstAppSrc parent;
@@ -150,9 +158,17 @@ struct _GstInterPipeSrc
   /* Currently started and listening */
   gboolean listening;
 
-  /* Pending serial events queue, guarded by serial_events_lock because it is
-   * pushed from the node's streaming thread and drained from this element's. */
+  /* Pending serial events, each a GstInterPipeSrcSerialEvent, guarded by
+   * serial_events_lock because they are queued from the node's streaming
+   * thread and drained from this element's. An event must reach downstream
+   * after the buffers the node forwarded before it and before the ones it
+   * forwarded after it. Buffers wait in the appsrc queue, so the two counters
+   * below place each event in that sequence: buffers_queued counts buffers
+   * this element put in the appsrc queue, buffers_taken counts buffers
+   * create() took out of it. */
   GQueue *pending_serial_events;
+  guint64 buffers_queued;
+  guint64 buffers_taken;
   GMutex serial_events_lock;
 
   /* Block switch */
@@ -275,6 +291,8 @@ gst_inter_pipe_src_init (GstInterPipeSrc * src)
   src->listen_to = NULL;
   src->listening = FALSE;
   src->pending_serial_events = g_queue_new ();
+  src->buffers_queued = 0;
+  src->buffers_taken = 0;
   g_mutex_init (&src->serial_events_lock);
   src->block_switch = FALSE;
   src->allow_renegotiation = TRUE;
@@ -427,6 +445,30 @@ gst_inter_pipe_src_get_property (GObject * object, guint prop_id,
 }
 
 static void
+gst_inter_pipe_src_serial_event_free (GstInterPipeSrcSerialEvent * pending)
+{
+  gst_event_unref (pending->event);
+  g_free (pending);
+}
+
+/* The appsrc queue was emptied (flush) or the element stopped: whatever was
+ * queued is gone, so restart the count. Events still pending were queued
+ * after buffers that will not come out any more; make them due before the
+ * next buffer. */
+static void
+gst_inter_pipe_src_reset_sequence (GstInterPipeSrc * src)
+{
+  GList *l;
+
+  g_mutex_lock (&src->serial_events_lock);
+  src->buffers_queued = 0;
+  src->buffers_taken = 0;
+  for (l = src->pending_serial_events->head; l != NULL; l = l->next)
+    ((GstInterPipeSrcSerialEvent *) l->data)->after = 0;
+  g_mutex_unlock (&src->serial_events_lock);
+}
+
+static void
 gst_inter_pipe_src_finalize (GObject * object)
 {
   GstInterPipeSrc *src;
@@ -435,7 +477,7 @@ gst_inter_pipe_src_finalize (GObject * object)
 
   /* Free pending serial events queue */
   g_queue_free_full (src->pending_serial_events,
-      (GDestroyNotify) gst_event_unref);
+      (GDestroyNotify) gst_inter_pipe_src_serial_event_free);
   g_mutex_clear (&src->serial_events_lock);
 
   if (src->listen_to) {
@@ -529,6 +571,7 @@ gst_inter_pipe_src_stop (GstBaseSrc * base)
    * gst_inter_pipe_sink_push_to_listener). */
   gst_app_src_set_caps (appsrc, NULL);
   src->caps_primed = FALSE;
+  gst_inter_pipe_src_reset_sequence (src);
 
   return basesrc_class->stop (base);
 }
@@ -595,6 +638,10 @@ gst_inter_pipe_src_event (GstBaseSrc * base, GstEvent * event)
   if (node)
     gst_object_unref (node);
 
+  /* A flush empties the appsrc queue. */
+  if (GST_EVENT_TYPE (event) == GST_EVENT_FLUSH_STOP)
+    gst_inter_pipe_src_reset_sequence (src);
+
   return basesrc_class->event (base, event);
 }
 
@@ -605,7 +652,6 @@ gst_inter_pipe_src_create (GstBaseSrc * base, guint64 offset, guint size,
   GstInterPipeSrc *src;
   GstEvent *serial_event;
   GQueue due_events = G_QUEUE_INIT;
-  guint64 curr_bytes;
   GstPad *srcpad;
   GstFlowReturn ret;
 
@@ -653,34 +699,28 @@ gst_inter_pipe_src_create (GstBaseSrc * base, guint64 offset, guint size,
     }
   }
 
-  /* Drain every serial event that is due, in order, not just the head: a cold
-   * attach queues stream-start and the producer's segment together, and
-   * sending one per buffer would put the first buffer out under the wrong
-   * segment. An event is due once its timestamp is not past this buffer's
-   * (an event stamped with the producer's previous buffer compares equal to
-   * this one), or once the appsrc queue has drained, so an event stamped ahead
-   * of every buffer still in flight cannot be held forever. The queue level
-   * is sampled once, after this buffer was taken. Decide and dequeue under the
-   * lock, but push downstream after releasing it so the lock is never held
-   * across gst_pad_push_event. */
+  /* Send every serial event that has to precede this buffer, in order: those
+   * the node forwarded before this buffer, i.e. queued while fewer buffers
+   * than this one had been queued. Events the node forwarded after this buffer
+   * wait for the next one. Placing events by sequence rather than by timestamp
+   * keeps them in their place both at startup (stream-start and the segment
+   * ahead of the first buffer) and mid-stream (a segment update between two
+   * queued buffers). Decide and dequeue under the lock, but push downstream
+   * after releasing it so the lock is never held across gst_pad_push_event. */
   g_mutex_lock (&src->serial_events_lock);
-  curr_bytes = gst_app_src_get_current_level_bytes (GST_APP_SRC (src));
+  src->buffers_taken++;
   while (!g_queue_is_empty (src->pending_serial_events)) {
-    GstEvent *head = g_queue_peek_head (src->pending_serial_events);
+    GstInterPipeSrcSerialEvent *head =
+        g_queue_peek_head (src->pending_serial_events);
 
-    GST_DEBUG_OBJECT (src,
-        "Got event with timestamp %" GST_TIME_FORMAT,
-        GST_TIME_ARGS (GST_EVENT_TIMESTAMP (head)));
-
-    if ((GST_EVENT_TIMESTAMP (head) > GST_BUFFER_PTS (*buf))
-        && (curr_bytes != 0)) {
-      GST_DEBUG_OBJECT (src, "Event %s timestamp is greater than the "
-          "buffer timestamp, can't send serial event yet",
-          GST_EVENT_TYPE_NAME (head));
+    if (head->after >= src->buffers_taken) {
+      GST_DEBUG_OBJECT (src, "Event %s follows this buffer, holding it",
+          GST_EVENT_TYPE_NAME (head->event));
       break;
     }
-    g_queue_push_tail (&due_events,
-        g_queue_pop_head (src->pending_serial_events));
+    g_queue_pop_head (src->pending_serial_events);
+    g_queue_push_tail (&due_events, head->event);
+    g_free (head);
   }
   g_mutex_unlock (&src->serial_events_lock);
 
@@ -972,6 +1012,12 @@ gst_inter_pipe_src_push_buffer (GstInterPipeIListener * iface,
   ret = gst_app_src_push_buffer (appsrc, buffer);
   if (ret != GST_FLOW_OK)
     return FALSE;
+
+  /* push_event runs on this same thread, so an event the node forwards after
+   * this buffer is queued after this count and placed after the buffer. */
+  g_mutex_lock (&src->serial_events_lock);
+  src->buffers_queued++;
+  g_mutex_unlock (&src->serial_events_lock);
 out:
   return TRUE;
 
@@ -994,6 +1040,7 @@ gst_inter_pipe_src_push_event (GstInterPipeIListener * iface, GstEvent * event,
   GstInterPipeSrc *src;
   GstAppSrc *appsrc;
   GstPad *srcpad;
+  GstInterPipeSrcSerialEvent *pending;
   guint64 srcbasetime;
   gboolean ret = TRUE;
 
@@ -1014,11 +1061,10 @@ gst_inter_pipe_src_push_event (GstInterPipeIListener * iface, GstEvent * event,
 
     event = gst_event_make_writable (event);
 
-    /* The event is stamped with the producer's last buffer timestamp and is
-     * released once buffers reach it (see create). Shift it the same way as
-     * the buffers it is compared to: only compensate-ts moves buffers into
-     * this element's running time. Passthrough buffers keep the producer's
-     * timestamps, and restart-ts buffers carry none when compared. */
+    /* The node stamps the event with its last buffer's timestamp. Keep it
+     * consistent with the buffers: only compensate-ts moves them into this
+     * element's running time. (Ordering does not depend on it, see
+     * create.) */
     if (GST_INTER_PIPE_SRC_COMPENSATE_TIMESTAMP == src->stream_sync) {
       srcbasetime = gst_element_get_base_time (GST_ELEMENT (appsrc));
 
@@ -1039,8 +1085,11 @@ gst_inter_pipe_src_push_event (GstInterPipeIListener * iface, GstEvent * event,
         " enqueued on serial pending events", GST_EVENT_TYPE_NAME (event),
         GST_TIME_ARGS (GST_EVENT_TIMESTAMP (event)));
 
+    pending = g_new (GstInterPipeSrcSerialEvent, 1);
+    pending->event = event;
     g_mutex_lock (&src->serial_events_lock);
-    g_queue_push_tail (src->pending_serial_events, event);
+    pending->after = src->buffers_queued;
+    g_queue_push_tail (src->pending_serial_events, pending);
     g_mutex_unlock (&src->serial_events_lock);
   }
   return ret;

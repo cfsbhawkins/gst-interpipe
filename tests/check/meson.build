@@ -18,6 +18,7 @@ core_tests = [
   [ 'gst/test_preroll_forwarding.c' ],
   [ 'gst/test_producer_latency.c' ],
   [ 'gst/test_reconfigure_event.c' ],
+  [ 'gst/test_serial_event_order.c' ],
   [ 'gst/test_set_caps.c' ],
 ]
 
