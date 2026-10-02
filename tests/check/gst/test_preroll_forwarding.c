@@ -324,6 +324,66 @@ GST_START_TEST (interpipe_preroll_paused_producer)
 
 GST_END_TEST;
 
+/* A consumer that attaches while the producer is paused missed the preroll
+ * hand-over. When the producer resumes and renders that frame, the late
+ * consumer must get it, and the one that already has it must not get it
+ * again. The producer makes a single frame, so the render is the late
+ * consumer's only chance. */
+GST_START_TEST (interpipe_preroll_listener_attached_while_paused)
+{
+  GstElement *producer, *consumer, *late_consumer;
+  Frames *f, *late;
+  GError *error = NULL;
+
+  f = frames_new ();
+  late = frames_new ();
+
+  consumer = gst_parse_launch (CONSUMER_DESC ("passthrough-ts"), &error);
+  fail_if (error, "%s", error ? error->message : "");
+  f->consumer = consumer;
+  add_probe (consumer, "fsink", consumer_probe, f);
+
+  producer = gst_parse_launch ("videotestsrc num-buffers=1 ! "
+      "video/x-raw,width=64,height=48,framerate=30/1 ! "
+      "interpipesink name=node sync=true", &error);
+  fail_if (error, "%s", error ? error->message : "");
+  add_probe (producer, "node", producer_probe, f);
+
+  set_state (consumer, GST_STATE_PLAYING);
+  set_state (producer, GST_STATE_PAUSED);
+  wait_frames (f, 1);
+
+  late_consumer = gst_parse_launch (CONSUMER_DESC ("passthrough-ts"), &error);
+  fail_if (error, "%s", error ? error->message : "");
+  late->consumer = late_consumer;
+  add_probe (late_consumer, "fsink", consumer_probe, late);
+  set_state (late_consumer, GST_STATE_PLAYING);
+
+  set_state (producer, GST_STATE_PLAYING);
+  wait_frames (late, 1);
+  /* Give a duplicate to the first consumer time to show up. */
+  g_usleep (200 * 1000);
+
+  g_mutex_lock (&late->lock);
+  fail_unless_equals_int (late->offsets->len, 1);
+  fail_unless_equals_uint64 (g_array_index (late->offsets, guint64, 0), 0);
+  g_mutex_unlock (&late->lock);
+  g_mutex_lock (&f->lock);
+  fail_unless_equals_int (f->offsets->len, 1);
+  g_mutex_unlock (&f->lock);
+
+  set_state (producer, GST_STATE_NULL);
+  set_state (late_consumer, GST_STATE_NULL);
+  set_state (consumer, GST_STATE_NULL);
+  gst_object_unref (producer);
+  gst_object_unref (late_consumer);
+  gst_object_unref (consumer);
+  frames_free (late);
+  frames_free (f);
+}
+
+GST_END_TEST;
+
 static Suite *
 gst_interpipe_suite (void)
 {
@@ -334,6 +394,7 @@ gst_interpipe_suite (void)
   tcase_add_test (tc, interpipe_preroll_first_frame_compensate_ts);
   tcase_add_test (tc, interpipe_preroll_after_flushing_seek);
   tcase_add_test (tc, interpipe_preroll_paused_producer);
+  tcase_add_test (tc, interpipe_preroll_listener_attached_while_paused);
 
   return suite;
 }
