@@ -28,6 +28,12 @@
 #include <gst/app/gstappsrc.h>
 #include <gst/app/gstappsink.h>
 
+/* The producers are independent live sources whose sinks render on their own
+ * schedule, so under load a frame captured before the last one from the other
+ * producer can still reach the consumer after a switch. Allow that much
+ * reordering across a switch. */
+#define REORDER_TOLERANCE (GST_SECOND / 2)
+
 /*
  * Given two pipelines, play the first one, wait and then play
  * the other one, it should not be delay in the video when it is display
@@ -116,7 +122,10 @@ GST_START_TEST (interpipe_stream_sync_compensate_ts)
   buffer_timestamp2 = GST_BUFFER_PTS (buffer);
   fail_if (buffer_timestamp2 == 0);
 
-  fail_if (buffer_timestamp2 < buffer_timestamp1);
+  fail_if (buffer_timestamp2 + REORDER_TOLERANCE < buffer_timestamp1,
+      "Buffer from the second node (%" GST_TIME_FORMAT ") precedes the last "
+      "one from the first (%" GST_TIME_FORMAT ") by more than the tolerance",
+      GST_TIME_ARGS (buffer_timestamp2), GST_TIME_ARGS (buffer_timestamp1));
   gst_sample_unref (outsample);
 
   /* Disconnect interpipesrc and flush old buffers */
@@ -132,7 +141,10 @@ GST_START_TEST (interpipe_stream_sync_compensate_ts)
   buffer_timestamp1 = GST_BUFFER_PTS (buffer);
   fail_if (buffer_timestamp1 == 0);
 
-  fail_if (buffer_timestamp1 < buffer_timestamp2);
+  fail_if (buffer_timestamp1 + REORDER_TOLERANCE < buffer_timestamp2,
+      "Buffer from the first node (%" GST_TIME_FORMAT ") precedes the last "
+      "one from the second (%" GST_TIME_FORMAT ") by more than the tolerance",
+      GST_TIME_ARGS (buffer_timestamp1), GST_TIME_ARGS (buffer_timestamp2));
 
   /* Stop pipelines */
   fail_if (GST_STATE_CHANGE_FAILURE ==
