@@ -594,6 +594,8 @@ gst_inter_pipe_src_create (GstBaseSrc * base, guint64 offset, guint size,
 {
   GstInterPipeSrc *src;
   GstEvent *serial_event;
+  GQueue due_events = G_QUEUE_INIT;
+  guint64 curr_bytes;
   GstPad *srcpad;
   GstFlowReturn ret;
 
@@ -641,32 +643,34 @@ gst_inter_pipe_src_create (GstBaseSrc * base, guint64 offset, guint size,
     }
   }
 
-  /* Drain the head serial event if its timestamp has been reached. Decide and
-   * dequeue under the lock, but push the event downstream after releasing it so
-   * we never hold the lock across gst_pad_push_event. */
-  serial_event = NULL;
+  /* Drain every serial event whose timestamp has been reached, in order, not
+   * just the head: a cold attach queues stream-start and the producer's
+   * segment together, and sending one per buffer would put the first buffer
+   * out under the wrong segment. Decide and dequeue under the lock, but push
+   * downstream after releasing it so the lock is never held across
+   * gst_pad_push_event. */
   g_mutex_lock (&src->serial_events_lock);
-  if (!g_queue_is_empty (src->pending_serial_events)) {
+  curr_bytes = gst_app_src_get_current_level_bytes (GST_APP_SRC (src));
+  while (!g_queue_is_empty (src->pending_serial_events)) {
     GstEvent *head = g_queue_peek_head (src->pending_serial_events);
-    guint64 curr_bytes;
 
     GST_DEBUG_OBJECT (src,
         "Got event with timestamp %" GST_TIME_FORMAT,
         GST_TIME_ARGS (GST_EVENT_TIMESTAMP (head)));
 
-    curr_bytes = gst_app_src_get_current_level_bytes (GST_APP_SRC (src));
-    if ((GST_EVENT_TIMESTAMP (head) < GST_BUFFER_PTS (*buf))
-        || (curr_bytes == 0)) {
-      serial_event = g_queue_pop_head (src->pending_serial_events);
-    } else {
+    if ((GST_EVENT_TIMESTAMP (head) >= GST_BUFFER_PTS (*buf))
+        && (curr_bytes != 0)) {
       GST_DEBUG_OBJECT (src, "Event %s timestamp is greater than the "
           "buffer timestamp, can't send serial event yet",
           GST_EVENT_TYPE_NAME (head));
+      break;
     }
+    g_queue_push_tail (&due_events,
+        g_queue_pop_head (src->pending_serial_events));
   }
   g_mutex_unlock (&src->serial_events_lock);
 
-  if (serial_event) {
+  while ((serial_event = g_queue_pop_head (&due_events)) != NULL) {
     GST_DEBUG_OBJECT (src, "Sending Serial Event %s",
         GST_EVENT_TYPE_NAME (serial_event));
     gst_pad_push_event (srcpad, serial_event);
