@@ -97,6 +97,7 @@ struct _GstInterPipeIListenerInterface
   gboolean (* push_event) (GstInterPipeIListener *iface, GstEvent *event, guint64 basetime);
   gboolean (* query) (GstInterPipeIListener *iface, GstQuery *query);
   gboolean (* send_eos) (GstInterPipeIListener *iface);
+  void (* latency_changed) (GstInterPipeIListener *iface);
 };
 
 /**
@@ -231,6 +232,7 @@ gboolean gst_inter_pipe_ilistener_query (GstInterPipeIListener *iface,
  * Return: True if the event was successfully pushed, False otherwise.
  */
 gboolean gst_inter_pipe_ilistener_send_eos (GstInterPipeIListener *iface);
+void gst_inter_pipe_ilistener_latency_changed (GstInterPipeIListener *iface);
 
 GType gst_inter_pipe_ilistener_get_type (void);
 

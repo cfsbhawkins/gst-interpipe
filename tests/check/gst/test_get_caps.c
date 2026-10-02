@@ -27,6 +27,78 @@
 #include <gst/app/gstappsrc.h>
 #include <gst/app/gstappsink.h>
 
+#define SAMPLE_TIMEOUT (10 * GST_SECOND)
+
+/* Pull a sample from the named appsink, waiting at most the given time.
+ * Returns whether one arrived. */
+static gboolean
+got_sample (GstPipeline * pipeline, const gchar * appsink_name,
+    GstClockTime timeout)
+{
+  GstElement *appsink;
+  GstSample *sample;
+
+  appsink = gst_bin_get_by_name (GST_BIN (pipeline), appsink_name);
+  fail_unless (appsink != NULL);
+  sample = gst_app_sink_try_pull_sample (GST_APP_SINK (appsink), timeout);
+  gst_object_unref (appsink);
+  if (!sample)
+    return FALSE;
+  gst_sample_unref (sample);
+  return TRUE;
+}
+
+/* Caps reach a listener through the producer's renegotiation, on the
+ * producer's streaming thread. A sample delivered to the listener's appsink
+ * proves that has happened, and that the listener took the caps. */
+static void
+wait_for_sample (GstPipeline * pipeline, const gchar * appsink_name)
+{
+  fail_unless (got_sample (pipeline, appsink_name, SAMPLE_TIMEOUT),
+      "No buffer delivered to %s", appsink_name);
+}
+
+/* Wait until the node has the given number of listeners. */
+static void
+wait_num_listeners (GstElement * intersink, guint expected)
+{
+  guint num_listeners = G_MAXUINT;
+  gint i;
+
+  for (i = 0; i < 100; i++) {
+    g_object_get (intersink, "num-listeners", &num_listeners, NULL);
+    if (num_listeners == expected)
+      break;
+    g_usleep (100 * 1000);
+  }
+  fail_unless_equals_int (num_listeners, expected);
+}
+
+/* Returns TRUE if the pipeline posted an error message on its bus, with the
+ * error text in *msg (transfer full). */
+static gboolean
+pipeline_has_error (GstPipeline * pipeline, gchar ** msg)
+{
+  GstBus *bus;
+  GstMessage *message;
+  gboolean has_error = FALSE;
+
+  bus = gst_pipeline_get_bus (pipeline);
+  message = gst_bus_poll (bus, GST_MESSAGE_ERROR, 0);
+  if (message) {
+    GError *error = NULL;
+
+    gst_message_parse_error (message, &error, NULL);
+    *msg = g_strdup (error->message);
+    g_error_free (error);
+    gst_message_unref (message);
+    has_error = TRUE;
+  }
+  gst_object_unref (bus);
+
+  return has_error;
+}
+
 /*
  * Given a interpipesrc with fixed caps, after the get caps,
  * the only valid caps on the interpipesrc are the same 
@@ -42,6 +114,7 @@ GST_START_TEST (interpipe_get_caps_one_interpipesrc)
   GstCaps *caps1;
   GstCaps *caps2;
   GError *error = NULL;
+  gchar *errmsg = NULL;
 
   /* Create one sink and two source pipelines */
   sink =
@@ -70,6 +143,12 @@ GST_START_TEST (interpipe_get_caps_one_interpipesrc)
   fail_if (GST_STATE_CHANGE_FAILURE == gst_element_get_state (GST_ELEMENT (src),
           NULL, NULL, GST_CLOCK_TIME_NONE));
 
+  wait_for_sample (src, "asink");
+  fail_if (pipeline_has_error (sink, &errmsg),
+      "Producer pipeline posted an error: %s", errmsg);
+  fail_if (pipeline_has_error (src, &errmsg),
+      "Listener pipeline posted an error: %s", errmsg);
+
   /* Verifies if interpipesink and interpipesrcs have the same caps
    */
   caps1 = gst_app_src_get_caps (GST_APP_SRC (intersrc));
@@ -90,6 +169,7 @@ GST_START_TEST (interpipe_get_caps_one_interpipesrc)
           GST_STATE_NULL));
 
   /* Cleanup */
+  g_free (errmsg);
   g_object_unref (intersink);
   g_object_unref (intersrc);
   g_object_unref (sink);
@@ -115,6 +195,7 @@ GST_START_TEST (interpipe_get_caps_two_interpipesrcs_intersection)
   GstCaps *caps2;
   GstCaps *caps3;
   GError *error = NULL;
+  gchar *errmsg = NULL;
 
   /* Create one sink and two source pipelines */
   sink =
@@ -157,6 +238,18 @@ GST_START_TEST (interpipe_get_caps_two_interpipesrcs_intersection)
       gst_element_get_state (GST_ELEMENT (src2), NULL, NULL,
           GST_CLOCK_TIME_NONE));
 
+  /* The second listener cannot take the caps negotiated for the first, so
+   * the node renegotiates upstream to the intersection of both. Each
+   * listener's caps are final once a buffer has reached it. */
+  wait_for_sample (src1, "asink1");
+  wait_for_sample (src2, "asink2");
+  fail_if (pipeline_has_error (sink, &errmsg),
+      "Producer pipeline posted an error: %s", errmsg);
+  fail_if (pipeline_has_error (src1, &errmsg),
+      "First listener pipeline posted an error: %s", errmsg);
+  fail_if (pipeline_has_error (src2, &errmsg),
+      "Second listener pipeline posted an error: %s", errmsg);
+
   /* Verifies if interpipesink and interpipesrcs have the same caps
    */
 
@@ -185,6 +278,7 @@ GST_START_TEST (interpipe_get_caps_two_interpipesrcs_intersection)
       gst_element_set_state (GST_ELEMENT (src2), GST_STATE_NULL));
 
   /* Cleanup */
+  g_free (errmsg);
   g_object_unref (intersink);
   g_object_unref (intersrc1);
   g_object_unref (intersrc2);
@@ -195,9 +289,12 @@ GST_START_TEST (interpipe_get_caps_two_interpipesrcs_intersection)
 
 GST_END_TEST;
 
-/* 
- * Given two interpipesrc with no intersection, the
- * get caps function must send a error message.
+/*
+ * Given two interpipesrc with no intersection, the node cannot serve both
+ * with one stream. The first listener is already receiving buffers when the
+ * second one joins: the node must detach only the second, keep serving the
+ * first, never feed the second caps it cannot accept, and no pipeline may
+ * error out.
  */
 
 GST_START_TEST (interpipe_get_caps_two_interpipesrcs_no_intersection)
@@ -208,10 +305,9 @@ GST_START_TEST (interpipe_get_caps_two_interpipesrcs_no_intersection)
   GstElement *intersink;
   GstElement *intersrc1;
   GstElement *intersrc2;
-  GstCaps *caps1;
-  GstCaps *caps2;
-  GstCaps *caps3;
+  gint i;
   GError *error = NULL;
+  gchar *errmsg = NULL;
 
   /* Create one sink and two source pipelines */
   sink =
@@ -221,10 +317,12 @@ GST_START_TEST (interpipe_get_caps_two_interpipesrcs_no_intersection)
 
   intersink = gst_bin_get_by_name (GST_BIN (sink), "intersink");
 
+  /* Keep only the newest sample so a pull after the second listener joins
+   * proves buffers are still flowing to the first. */
   src1 =
       GST_PIPELINE (gst_parse_launch
       ("interpipesrc name=intersrc1 listen-to=intersink ! capsfilter caps=video/x-raw,format=(string)I420,width=[720,1280],height=[640,1080],framerate=(fraction)30/1 ! "
-          "appsink name=asink1 async=false", &error));
+          "appsink name=asink1 async=false max-buffers=1 drop=true", &error));
   fail_if (error);
 
   intersrc1 = gst_bin_get_by_name (GST_BIN (src1), "intersrc1");
@@ -248,23 +346,31 @@ GST_START_TEST (interpipe_get_caps_two_interpipesrcs_no_intersection)
   fail_if (GST_STATE_CHANGE_FAILURE ==
       gst_element_get_state (GST_ELEMENT (src1), NULL, NULL,
           GST_CLOCK_TIME_NONE));
+  wait_for_sample (src1, "asink1");
+
   fail_if (GST_STATE_CHANGE_FAILURE ==
       gst_element_set_state (GST_ELEMENT (src2), GST_STATE_PLAYING));
   fail_if (GST_STATE_CHANGE_FAILURE ==
       gst_element_get_state (GST_ELEMENT (src2), NULL, NULL,
           GST_CLOCK_TIME_NONE));
 
-  /* Verifies if there are caps set in the elements
-   */
+  /* The renegotiation runs on the producer's streaming thread; give it time
+   * to detach the second listener. */
+  wait_num_listeners (intersink, 1);
 
-  caps1 = gst_app_src_get_caps (GST_APP_SRC (intersrc1));
-  fail_if (!caps1);
+  /* The first listener is still served, and keeps being served. */
+  for (i = 0; i < 3; i++)
+    wait_for_sample (src1, "asink1");
+  wait_num_listeners (intersink, 1);
+  fail_if (got_sample (src2, "asink2", 0),
+      "The incompatible listener received a buffer");
 
-  caps2 = gst_app_src_get_caps (GST_APP_SRC (intersrc2));
-  fail_if (!caps2);
-
-  caps3 = gst_app_sink_get_caps (GST_APP_SINK (intersink));
-  fail_if (!caps3);
+  fail_if (pipeline_has_error (sink, &errmsg),
+      "Producer pipeline posted an error: %s", errmsg);
+  fail_if (pipeline_has_error (src1, &errmsg),
+      "First listener pipeline posted an error: %s", errmsg);
+  fail_if (pipeline_has_error (src2, &errmsg),
+      "Second listener pipeline posted an error: %s", errmsg);
 
   /* Stop pipelines */
   fail_if (GST_STATE_CHANGE_FAILURE ==
@@ -275,6 +381,7 @@ GST_START_TEST (interpipe_get_caps_two_interpipesrcs_no_intersection)
       gst_element_set_state (GST_ELEMENT (src2), GST_STATE_NULL));
 
   /* Cleanup */
+  g_free (errmsg);
   g_object_unref (intersink);
   g_object_unref (intersrc1);
   g_object_unref (intersrc2);

@@ -7,6 +7,7 @@ core_tests = [
   [ 'gst/test_cold_attach.c' ],
   [ 'gst/test_force_key_unit_event.c' ],
   [ 'gst/test_stream_sync.c' ],
+  [ 'gst/test_stream_sync_retiming.c' ],
   [ 'gst/test_get_caps.c' ],
   [ 'gst/test_hot_plug.c' ],
   [ 'gst/test_in_bounds_events.c' ],
@@ -14,7 +15,10 @@ core_tests = [
   [ 'gst/test_node_name_removed.c' ],
   [ 'gst/test_out_of_bounds_events.c' ],
   [ 'gst/test_out_of_bounds_upstream_events.c' ],
+  [ 'gst/test_preroll_forwarding.c' ],
+  [ 'gst/test_producer_latency.c' ],
   [ 'gst/test_reconfigure_event.c' ],
+  [ 'gst/test_serial_event_order.c' ],
   [ 'gst/test_set_caps.c' ],
 ]
 
@@ -24,7 +28,7 @@ test_defines = [
 ]
 
 # Define test dependencies
-test_deps=[gst_app_dep, gst_check_dep, interpipes_dep]
+test_deps=[gst_app_dep, gst_video_dep, gst_check_dep, interpipes_dep]
 
 # Define plugins path
 gst_dep = dependency('gstreamer-1.0')
