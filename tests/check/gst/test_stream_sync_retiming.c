@@ -71,6 +71,18 @@ typedef struct
   GArray *pts;
   GArray *running_times;
   GArray *segment_starts;
+  /* Start of the segment in force downstream when each buffer arrived. */
+  GArray *segment_at_buffer;
+  guint64 current_segment_start;
+  /* Seqnums of the producer's stream-start and segment, and whether each had
+   * reached the consumer's sink before its first buffer. */
+  guint32 producer_stream_start_seqnum;
+  guint32 producer_segment_seqnum;
+  gboolean stream_start_before_buffer;
+  gboolean segment_before_buffer;
+  /* When set, the consumer's streaming thread is held until this many frames
+   * were produced, so they queue up in its appsrc. */
+  guint hold_until_produced;
   guint rendered;
   GstElement *consumer;
 } Retiming;
@@ -88,6 +100,8 @@ retiming_new (void)
   r->pts = g_array_new (FALSE, FALSE, sizeof (GstClockTime));
   r->running_times = g_array_new (FALSE, FALSE, sizeof (GstClockTime));
   r->segment_starts = g_array_new (FALSE, FALSE, sizeof (guint64));
+  r->segment_at_buffer = g_array_new (FALSE, FALSE, sizeof (guint64));
+  r->current_segment_start = G_MAXUINT64;
 
   return r;
 }
@@ -100,6 +114,7 @@ retiming_free (Retiming * r)
   g_array_free (r->pts, TRUE);
   g_array_free (r->running_times, TRUE);
   g_array_free (r->segment_starts, TRUE);
+  g_array_free (r->segment_at_buffer, TRUE);
   g_cond_clear (&r->cond);
   g_mutex_clear (&r->lock);
   g_free (r);
@@ -107,6 +122,46 @@ retiming_free (Retiming * r)
 
 /* Shift the producer's segment and timestamps by TIMELINE_OFFSET, keeping
  * running time unchanged, and record each frame's resulting PTS. */
+static void
+record_producer_event (Retiming * r, GstEvent * event)
+{
+  g_mutex_lock (&r->lock);
+  if (GST_EVENT_TYPE (event) == GST_EVENT_STREAM_START)
+    r->producer_stream_start_seqnum = gst_event_get_seqnum (event);
+  else if (GST_EVENT_TYPE (event) == GST_EVENT_SEGMENT)
+    r->producer_segment_seqnum = gst_event_get_seqnum (event);
+  g_mutex_unlock (&r->lock);
+}
+
+static void
+record_produced (Retiming * r, GstBuffer * buffer)
+{
+  gint64 *offset = g_new (gint64, 1);
+  GstClockTime *pts = g_new (GstClockTime, 1);
+
+  *offset = GST_BUFFER_OFFSET (buffer);
+  *pts = GST_BUFFER_PTS (buffer);
+  g_mutex_lock (&r->lock);
+  g_hash_table_replace (r->produced, offset, pts);
+  g_cond_broadcast (&r->cond);
+  g_mutex_unlock (&r->lock);
+}
+
+/* Record the producer's frames and events without changing them. */
+static GstPadProbeReturn
+plain_producer_probe (GstPad * pad, GstPadProbeInfo * info,
+    gpointer user_data)
+{
+  Retiming *r = user_data;
+
+  if (GST_PAD_PROBE_INFO_TYPE (info) & GST_PAD_PROBE_TYPE_BUFFER)
+    record_produced (r, GST_PAD_PROBE_INFO_BUFFER (info));
+  else
+    record_producer_event (r, GST_PAD_PROBE_INFO_EVENT (info));
+
+  return GST_PAD_PROBE_OK;
+}
+
 static GstPadProbeReturn
 producer_probe (GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
 {
@@ -115,21 +170,12 @@ producer_probe (GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
   if (GST_PAD_PROBE_INFO_TYPE (info) & GST_PAD_PROBE_TYPE_BUFFER) {
     GstBuffer *buffer = gst_buffer_make_writable (GST_PAD_PROBE_INFO_BUFFER
         (info));
-    gint64 *offset;
-    GstClockTime *pts;
 
     GST_BUFFER_PTS (buffer) += TIMELINE_OFFSET;
     if (GST_CLOCK_TIME_IS_VALID (GST_BUFFER_DTS (buffer)))
       GST_BUFFER_DTS (buffer) += TIMELINE_OFFSET;
     GST_PAD_PROBE_INFO_DATA (info) = buffer;
-
-    offset = g_new (gint64, 1);
-    *offset = GST_BUFFER_OFFSET (buffer);
-    pts = g_new (GstClockTime, 1);
-    *pts = GST_BUFFER_PTS (buffer);
-    g_mutex_lock (&r->lock);
-    g_hash_table_replace (r->produced, offset, pts);
-    g_mutex_unlock (&r->lock);
+    record_produced (r, buffer);
   } else {
     GstEvent *event = GST_PAD_PROBE_INFO_EVENT (info);
 
@@ -150,7 +196,9 @@ producer_probe (GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
       gst_event_set_seqnum (replacement, gst_event_get_seqnum (event));
       gst_event_unref (event);
       GST_PAD_PROBE_INFO_DATA (info) = replacement;
+      event = replacement;
     }
+    record_producer_event (r, event);
   }
 
   return GST_PAD_PROBE_OK;
@@ -181,21 +229,47 @@ consumer_probe (GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
     g_array_append_val (r->offsets, offset);
     g_array_append_val (r->pts, pts);
     g_array_append_val (r->running_times, running_time);
+    g_array_append_val (r->segment_at_buffer, r->current_segment_start);
     g_mutex_unlock (&r->lock);
   } else {
     GstEvent *event = GST_PAD_PROBE_INFO_EVENT (info);
+    guint32 seqnum = gst_event_get_seqnum (event);
 
+    g_mutex_lock (&r->lock);
     if (GST_EVENT_TYPE (event) == GST_EVENT_SEGMENT) {
       const GstSegment *segment;
 
       gst_event_parse_segment (event, &segment);
-      g_mutex_lock (&r->lock);
       g_array_append_val (r->segment_starts, segment->start);
-      g_mutex_unlock (&r->lock);
+      r->current_segment_start = segment->start;
+      if (r->offsets->len == 0 && seqnum == r->producer_segment_seqnum)
+        r->segment_before_buffer = TRUE;
+    } else if (GST_EVENT_TYPE (event) == GST_EVENT_STREAM_START) {
+      if (r->offsets->len == 0 && seqnum == r->producer_stream_start_seqnum)
+        r->stream_start_before_buffer = TRUE;
     }
+    g_mutex_unlock (&r->lock);
   }
 
   return GST_PAD_PROBE_OK;
+}
+
+/* Hold the consumer's streaming thread on its own first event until the
+ * producer has queued hold_until_produced frames into the consumer's appsrc.
+ * The event goes through the source pad before the first buffer is taken. */
+static GstPadProbeReturn
+hold_consumer_probe (GstPad * pad, GstPadProbeInfo * info, gpointer user_data)
+{
+  Retiming *r = user_data;
+  gint64 deadline = g_get_monotonic_time () + 10 * G_TIME_SPAN_SECOND;
+
+  g_mutex_lock (&r->lock);
+  while (g_hash_table_size (r->produced) < r->hold_until_produced)
+    if (!g_cond_wait_until (&r->cond, &r->lock, deadline))
+      break;
+  g_mutex_unlock (&r->lock);
+
+  return GST_PAD_PROBE_REMOVE;
 }
 
 /* fakesink handoff: emitted only for buffers the sink actually renders, not
@@ -243,8 +317,9 @@ play (GstElement * pipeline)
  * pipelines are returned so the caller can read their base times before
  * tearing them down. */
 static Retiming *
-run (const gchar * stream_sync, GstElement ** producer_out,
-    GstElement ** consumer_out)
+run_with (const gchar * stream_sync, const gchar * producer_desc,
+    GstPadProbeCallback probe, const gchar * sink_props, guint hold,
+    GstElement ** producer_out, GstElement ** consumer_out)
 {
   Retiming *r = retiming_new ();
   GstElement *producer, *consumer, *fsink;
@@ -252,9 +327,9 @@ run (const gchar * stream_sync, GstElement ** producer_out,
   gchar *desc;
   GError *error = NULL;
 
-  desc = g_strdup_printf ("interpipesrc listen-to=retiming_node is-live=true "
-      "format=time stream-sync=%s ! fakesink name=fsink sync=true "
-      "async=false signal-handoffs=true", stream_sync);
+  desc = g_strdup_printf ("interpipesrc name=isrc listen-to=retiming_node "
+      "is-live=true format=time stream-sync=%s ! fakesink name=fsink %s "
+      "async=false signal-handoffs=true", stream_sync, sink_props);
   consumer = gst_parse_launch (desc, &error);
   g_free (desc);
   fail_if (error, "%s", error ? error->message : "");
@@ -264,12 +339,20 @@ run (const gchar * stream_sync, GstElement ** producer_out,
   g_signal_connect (fsink, "handoff", G_CALLBACK (on_handoff), r);
   gst_object_unref (fsink);
   add_probe (consumer, "fsink", "sink", consumer_probe, r);
+  r->hold_until_produced = hold;
+  if (hold) {
+    GstElement *isrc = gst_bin_get_by_name (GST_BIN (consumer), "isrc");
+    GstPad *srcpad = gst_element_get_static_pad (isrc, "src");
 
-  producer = gst_parse_launch ("videotestsrc is-live=true ! "
-      "video/x-raw,width=64,height=48,framerate=30/1 ! "
-      "interpipesink name=retiming_node sync=false async=false", &error);
+    gst_pad_add_probe (srcpad, GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM,
+        hold_consumer_probe, r, NULL);
+    gst_object_unref (srcpad);
+    gst_object_unref (isrc);
+  }
+
+  producer = gst_parse_launch (producer_desc, &error);
   fail_if (error, "%s", error ? error->message : "");
-  add_probe (producer, "retiming_node", "sink", producer_probe, r);
+  add_probe (producer, "retiming_node", "sink", probe, r);
 
   /* Consumer first: the producer's segment then reaches a running consumer. */
   play (consumer);
@@ -285,6 +368,20 @@ run (const gchar * stream_sync, GstElement ** producer_out,
   *producer_out = producer;
   *consumer_out = consumer;
   return r;
+}
+
+#define LIVE_PRODUCER \
+    "videotestsrc is-live=true ! " \
+    "video/x-raw,width=64,height=48,framerate=30/1 ! " \
+    "interpipesink name=retiming_node sync=false async=false"
+
+/* The live producer offset by TIMELINE_OFFSET, into a clock-synced sink. */
+static Retiming *
+run (const gchar * stream_sync, GstElement ** producer_out,
+    GstElement ** consumer_out)
+{
+  return run_with (stream_sync, LIVE_PRODUCER, producer_probe, "sync=true", 0,
+      producer_out, consumer_out);
 }
 
 static void
@@ -339,6 +436,8 @@ GST_START_TEST (interpipe_retiming_passthrough_ts)
 
     fail_unless_equals_uint64 (g_array_index (r->pts, GstClockTime, i),
         produced_pts (r, offset));
+    fail_unless_equals_uint64 (g_array_index (r->segment_at_buffer, guint64,
+            i), TIMELINE_OFFSET);
   }
   g_mutex_unlock (&r->lock);
 
@@ -371,6 +470,8 @@ GST_START_TEST (interpipe_retiming_compensate_ts)
 
     /* Same absolute clock time, expressed against the consumer's base. */
     fail_unless_equals_uint64 (out + consumer_base, in + producer_base);
+    fail_unless_equals_uint64 (g_array_index (r->segment_at_buffer, guint64,
+            i), TIMELINE_OFFSET);
   }
   g_mutex_unlock (&r->lock);
 
@@ -421,6 +522,53 @@ GST_START_TEST (interpipe_retiming_restart_ts)
 
 GST_END_TEST;
 
+#define NON_LIVE_PRODUCER \
+    "videotestsrc ! video/x-raw,width=64,height=48,framerate=30/1 ! " \
+    "interpipesink name=retiming_node sync=false async=false"
+
+/* The producer's stream-start and segment reach the consumer's downstream
+ * before its first buffer. With a non-live producer the events are stamped 0
+ * and the first buffer's PTS is 0 too. The consumer's streaming thread is held
+ * until ten frames have queued in its appsrc behind the first, so an event due
+ * at the first buffer's own timestamp must not wait for the queue to drain.
+ * The consumer's sink does not sync, so the producer's non-live timeline does
+ * not matter to it. */
+static void
+check_events_precede_first_buffer (const gchar * stream_sync)
+{
+  GstElement *producer, *consumer;
+  Retiming *r;
+
+  r = run_with (stream_sync, NON_LIVE_PRODUCER, plain_producer_probe,
+      "sync=false", 10, &producer, &consumer);
+
+  g_mutex_lock (&r->lock);
+  fail_unless (r->offsets->len > 0, "No buffer reached the consumer");
+  fail_unless_equals_uint64 (g_array_index (r->offsets, guint64, 0), 0);
+  fail_unless (r->stream_start_before_buffer,
+      "The producer's stream-start did not precede the first buffer");
+  fail_unless (r->segment_before_buffer,
+      "The producer's segment did not precede the first buffer");
+  g_mutex_unlock (&r->lock);
+
+  stop (producer, consumer);
+  retiming_free (r);
+}
+
+GST_START_TEST (interpipe_retiming_events_first_passthrough_ts)
+{
+  check_events_precede_first_buffer ("passthrough-ts");
+}
+
+GST_END_TEST;
+
+GST_START_TEST (interpipe_retiming_events_first_compensate_ts)
+{
+  check_events_precede_first_buffer ("compensate-ts");
+}
+
+GST_END_TEST;
+
 static Suite *
 gst_interpipe_suite (void)
 {
@@ -431,6 +579,8 @@ gst_interpipe_suite (void)
   tcase_add_test (tc, interpipe_retiming_passthrough_ts);
   tcase_add_test (tc, interpipe_retiming_compensate_ts);
   tcase_add_test (tc, interpipe_retiming_restart_ts);
+  tcase_add_test (tc, interpipe_retiming_events_first_passthrough_ts);
+  tcase_add_test (tc, interpipe_retiming_events_first_compensate_ts);
 
   return suite;
 }
