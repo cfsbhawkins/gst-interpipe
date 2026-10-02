@@ -85,6 +85,7 @@ static gboolean gst_inter_pipe_sink_set_caps (GstBaseSink * base,
     GstCaps * filter);
 static gboolean gst_inter_pipe_sink_event (GstBaseSink * base,
     GstEvent * event);
+static gboolean gst_inter_pipe_sink_stop (GstBaseSink * base);
 static gboolean gst_inter_pipe_sink_propose_allocation (GstBaseSink * base,
     GstQuery * query);
 static gboolean gst_inter_pipe_sink_are_caps_compatible (GstInterPipeSink *
@@ -124,6 +125,12 @@ struct _GstInterPipeSink
 
   /** Last buffer timestamp */
   guint64 last_buffer_timestamp;
+
+  /* The buffer last forwarded from preroll, held until the base sink renders
+   * it so that render can recognise it and not forward it a second time.
+   * Holding the ref keeps the pointer from being reused for another buffer
+   * in the meantime. Guarded by the object lock. */
+  GstBuffer *preroll_buffer;
 
   GMutex listeners_mutex;
 };
@@ -179,6 +186,7 @@ gst_inter_pipe_sink_class_init (GstInterPipeSinkClass * klass)
   basesink_class->get_caps = GST_DEBUG_FUNCPTR (gst_inter_pipe_sink_get_caps);
   basesink_class->set_caps = GST_DEBUG_FUNCPTR (gst_inter_pipe_sink_set_caps);
   basesink_class->event = GST_DEBUG_FUNCPTR (gst_inter_pipe_sink_event);
+  basesink_class->stop = GST_DEBUG_FUNCPTR (gst_inter_pipe_sink_stop);
   basesink_class->propose_allocation =
       GST_DEBUG_FUNCPTR (gst_inter_pipe_sink_propose_allocation);
 }
@@ -212,6 +220,7 @@ gst_inter_pipe_sink_init (GstInterPipeSink * sink)
   sink->forward_eos = FALSE;
   sink->forward_events = TRUE;
   sink->last_buffer_timestamp = 0;
+  sink->preroll_buffer = NULL;
 
   g_mutex_init (&sink->listeners_mutex);
 
@@ -314,6 +323,8 @@ gst_inter_pipe_sink_finalize (GObject * object)
   if (sink->caps_negotiated) {
     gst_caps_unref (sink->caps_negotiated);
   }
+
+  gst_buffer_replace (&sink->preroll_buffer, NULL);
 
   g_hash_table_destroy (sink->listeners);
 
@@ -799,6 +810,20 @@ out:
 }
 
 static gboolean
+gst_inter_pipe_sink_stop (GstBaseSink * base)
+{
+  GstInterPipeSink *sink = GST_INTER_PIPE_SINK (base);
+
+  /* A buffer prerolled but never rendered (flushed, or the pipeline stopped
+   * in PAUSED) must not be matched against the next run's buffers. */
+  GST_OBJECT_LOCK (sink);
+  gst_buffer_replace (&sink->preroll_buffer, NULL);
+  GST_OBJECT_UNLOCK (sink);
+
+  return GST_BASE_SINK_CLASS (gst_inter_pipe_sink_parent_class)->stop (base);
+}
+
+static gboolean
 gst_inter_pipe_sink_propose_allocation (GstBaseSink * base, GstQuery * query)
 {
   struct AllocQueryCtx ctx = { 0 };
@@ -994,10 +1019,31 @@ gst_inter_pipe_sink_new_buffer (GstAppSink * asink, gpointer data)
 {
   GstInterPipeSink *sink;
   GstSample *sample;
+  GstBuffer *buffer;
+  gboolean already_forwarded;
 
   sink = GST_INTER_PIPE_SINK (asink);
 
   sample = gst_app_sink_pull_sample (asink);
+  if (!sample)
+    return GST_FLOW_OK;
+
+  /* The base sink renders every buffer it prerolled, and new_preroll has
+   * already forwarded that one. Forwarding it again would hand listeners a
+   * duplicate whose timestamp is stale by the time it is rendered. */
+  buffer = gst_sample_get_buffer (sample);
+  GST_OBJECT_LOCK (sink);
+  already_forwarded = buffer && buffer == sink->preroll_buffer;
+  gst_buffer_replace (&sink->preroll_buffer, NULL);
+  GST_OBJECT_UNLOCK (sink);
+
+  if (already_forwarded) {
+    GST_LOG_OBJECT (sink, "Buffer %p was forwarded at preroll, not forwarding "
+        "it again", buffer);
+    gst_sample_unref (sample);
+    return GST_FLOW_OK;
+  }
+
   gst_inter_pipe_sink_process_sample (sink, sample);
 
   return GST_FLOW_OK;
@@ -1013,6 +1059,13 @@ gst_inter_pipe_sink_new_preroll (GstAppSink * asink, gpointer data)
   sink = GST_INTER_PIPE_SINK (asink);
 
   sample = gst_app_sink_pull_preroll (asink);
+  if (!sample)
+    return GST_FLOW_OK;
+
+  GST_OBJECT_LOCK (sink);
+  gst_buffer_replace (&sink->preroll_buffer, gst_sample_get_buffer (sample));
+  GST_OBJECT_UNLOCK (sink);
+
   gst_inter_pipe_sink_process_sample (sink, sample);
 
   return GST_FLOW_OK;
