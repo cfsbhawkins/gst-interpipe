@@ -56,7 +56,7 @@ LT_INIT
 
 dnl *** required versions of GStreamer stuff ***
 GST_REQ=1.10
-GSTPB_REQ=1.0.5
+GSTPB_REQ=1.10
 
 dnl *** autotools stuff ****
 

@@ -28,11 +28,14 @@
 #include <gst/app/gstappsrc.h>
 #include <gst/app/gstappsink.h>
 
-/* The producers are independent live sources whose sinks render on their own
- * schedule, so under load a frame captured before the last one from the other
- * producer can still reach the consumer after a switch. Allow that much
- * reordering across a switch. */
-#define REORDER_TOLERANCE (GST_SECOND / 2)
+/* The producers run at 5 fps. They are independent live sources whose sinks
+ * render on their own schedule, so under load a frame captured before the
+ * last one from the other producer can still reach the consumer after a
+ * switch. Allow two frames of reordering across a switch, which covers the
+ * scheduling delay seen on loaded machines. Exact retiming is covered by
+ * test_stream_sync_retiming. */
+#define FRAME_DURATION (GST_SECOND / 5)
+#define REORDER_TOLERANCE (2 * FRAME_DURATION)
 
 /*
  * Given two pipelines, play the first one, wait and then play
