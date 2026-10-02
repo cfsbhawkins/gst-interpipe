@@ -188,9 +188,10 @@ struct _GstInterPipeSrc
   /* Stream synchronization */
   GstInterPipeSrcStreamSync stream_sync;
 
-  /* Producer render delay last seen, cached so create() can tell when it
-   * changed. Compared and stored under the object lock, from create() and
-   * from the latency query. See gst_inter_pipe_src_query. */
+  /* Producer render delay this element last asked its pipeline to apply,
+   * cached so create() can tell when it changed. Only create() compares and
+   * stores it, under the object lock; the latency query just reads the node
+   * (see gst_inter_pipe_src_query). */
   GstClockTime producer_latency;
 
   /* Set (atomically) when the producer's render delay may have changed: on
@@ -1237,9 +1238,10 @@ gst_inter_pipe_src_query (GstBaseSrc * base, GstQuery * query)
         if (GST_CLOCK_TIME_IS_VALID (max))
           max += producer;
       }
-      GST_OBJECT_LOCK (src);
-      src->producer_latency = producer;
-      GST_OBJECT_UNLOCK (src);
+      /* Answering does not touch producer_latency: a query is not proof the
+       * pipeline applied the value (an application can query at any time),
+       * and recording it here would hide a change create() still has to
+       * apply. */
     }
     gst_query_set_latency (query, live, min, max);
     GST_DEBUG_OBJECT (src, "Latency query: live %d, min %" GST_TIME_FORMAT

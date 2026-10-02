@@ -169,15 +169,33 @@ consumer_sink (GstPipeline * consumer)
 }
 
 /* The latency the consumer's sink is configured with when upstream reports
- * the given latency: upstream plus the sink's own processing deadline. */
+ * the given latency: upstream plus the sink's own processing deadline, which
+ * GstBaseSink has since 1.16 (none before). */
 static GstClockTime
 expected_latency (GstPipeline * consumer, GstClockTime upstream)
 {
+  GstClockTime deadline = 0;
+#if GST_CHECK_VERSION(1,16,0)
   GstBaseSink *fsink = consumer_sink (consumer);
-  GstClockTime deadline = gst_base_sink_get_processing_deadline (fsink);
 
+  deadline = gst_base_sink_get_processing_deadline (fsink);
   gst_object_unref (fsink);
+#endif
+
   return upstream + deadline;
+}
+
+/* Run a LATENCY query on the consumer's interpipesrc, as an application
+ * might at any time. It must not get in the way of applying a change. */
+static void
+query_consumer_latency (GstPipeline * consumer)
+{
+  GstElement *isrc = gst_bin_get_by_name (GST_BIN (consumer), "isrc");
+  GstQuery *query = gst_query_new_latency ();
+
+  fail_unless (gst_element_query (isrc, query));
+  gst_query_unref (query);
+  gst_object_unref (isrc);
 }
 
 static GstClockTime
@@ -308,6 +326,8 @@ GST_START_TEST (interpipe_producer_latency_change_followed)
 
   g_object_set (producer, "latency", 2 * PRODUCER_LATENCY, NULL);
   fail_unless (gst_bin_recalculate_latency (GST_BIN (producer)));
+  /* An application query in between must not swallow the change. */
+  query_consumer_latency (consumer);
   assert_consumer_latency (consumer, 2 * PRODUCER_LATENCY);
 
   stop_pipeline (consumer);
@@ -336,6 +356,7 @@ GST_START_TEST (interpipe_producer_latency_ts_offset_render_delay)
   sink = gst_bin_get_by_name (GST_BIN (producer), "sink");
   g_object_set (sink, "ts-offset", (gint64) (200 * GST_MSECOND), NULL);
   gst_object_unref (sink);
+  query_consumer_latency (consumer);
   /* The consumer re-reads the delay on its next buffer. */
   assert_consumer_latency (consumer,
       PRODUCER_LATENCY + 200 * GST_MSECOND - 30 * GST_MSECOND);
