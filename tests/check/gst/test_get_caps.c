@@ -27,21 +27,51 @@
 #include <gst/app/gstappsrc.h>
 #include <gst/app/gstappsink.h>
 
-/* Caps reach a listener through the producer's renegotiation, on the
- * producer's streaming thread. A sample delivered to the listener's appsink
- * proves that has happened, and that the listener took the caps. */
-static void
-wait_for_sample (GstPipeline * pipeline, const gchar * appsink_name)
+#define SAMPLE_TIMEOUT (10 * GST_SECOND)
+
+/* Pull a sample from the named appsink, waiting at most the given time.
+ * Returns whether one arrived. */
+static gboolean
+got_sample (GstPipeline * pipeline, const gchar * appsink_name,
+    GstClockTime timeout)
 {
   GstElement *appsink;
   GstSample *sample;
 
   appsink = gst_bin_get_by_name (GST_BIN (pipeline), appsink_name);
   fail_unless (appsink != NULL);
-  sample = gst_app_sink_pull_sample (GST_APP_SINK (appsink));
-  fail_if (!sample, "No buffer delivered to %s", appsink_name);
-  gst_sample_unref (sample);
+  sample = gst_app_sink_try_pull_sample (GST_APP_SINK (appsink), timeout);
   gst_object_unref (appsink);
+  if (!sample)
+    return FALSE;
+  gst_sample_unref (sample);
+  return TRUE;
+}
+
+/* Caps reach a listener through the producer's renegotiation, on the
+ * producer's streaming thread. A sample delivered to the listener's appsink
+ * proves that has happened, and that the listener took the caps. */
+static void
+wait_for_sample (GstPipeline * pipeline, const gchar * appsink_name)
+{
+  fail_unless (got_sample (pipeline, appsink_name, SAMPLE_TIMEOUT),
+      "No buffer delivered to %s", appsink_name);
+}
+
+/* Wait until the node has the given number of listeners. */
+static void
+wait_num_listeners (GstElement * intersink, guint expected)
+{
+  guint num_listeners = G_MAXUINT;
+  gint i;
+
+  for (i = 0; i < 100; i++) {
+    g_object_get (intersink, "num-listeners", &num_listeners, NULL);
+    if (num_listeners == expected)
+      break;
+    g_usleep (100 * 1000);
+  }
+  fail_unless_equals_int (num_listeners, expected);
 }
 
 /* Returns TRUE if the pipeline posted an error message on its bus, with the
@@ -261,9 +291,10 @@ GST_END_TEST;
 
 /*
  * Given two interpipesrc with no intersection, the node cannot serve both
- * with one stream. It must log the failed intersection and detach every
- * listener rather than feed either of them caps it cannot accept, and no
- * pipeline may error out.
+ * with one stream. The first listener is already receiving buffers when the
+ * second one joins: the node must detach only the second, keep serving the
+ * first, never feed the second caps it cannot accept, and no pipeline may
+ * error out.
  */
 
 GST_START_TEST (interpipe_get_caps_two_interpipesrcs_no_intersection)
@@ -274,7 +305,6 @@ GST_START_TEST (interpipe_get_caps_two_interpipesrcs_no_intersection)
   GstElement *intersink;
   GstElement *intersrc1;
   GstElement *intersrc2;
-  guint num_listeners = 1;
   gint i;
   GError *error = NULL;
   gchar *errmsg = NULL;
@@ -287,10 +317,12 @@ GST_START_TEST (interpipe_get_caps_two_interpipesrcs_no_intersection)
 
   intersink = gst_bin_get_by_name (GST_BIN (sink), "intersink");
 
+  /* Keep only the newest sample so a pull after the second listener joins
+   * proves buffers are still flowing to the first. */
   src1 =
       GST_PIPELINE (gst_parse_launch
       ("interpipesrc name=intersrc1 listen-to=intersink ! capsfilter caps=video/x-raw,format=(string)I420,width=[720,1280],height=[640,1080],framerate=(fraction)30/1 ! "
-          "appsink name=asink1 async=false", &error));
+          "appsink name=asink1 async=false max-buffers=1 drop=true", &error));
   fail_if (error);
 
   intersrc1 = gst_bin_get_by_name (GST_BIN (src1), "intersrc1");
@@ -314,6 +346,8 @@ GST_START_TEST (interpipe_get_caps_two_interpipesrcs_no_intersection)
   fail_if (GST_STATE_CHANGE_FAILURE ==
       gst_element_get_state (GST_ELEMENT (src1), NULL, NULL,
           GST_CLOCK_TIME_NONE));
+  wait_for_sample (src1, "asink1");
+
   fail_if (GST_STATE_CHANGE_FAILURE ==
       gst_element_set_state (GST_ELEMENT (src2), GST_STATE_PLAYING));
   fail_if (GST_STATE_CHANGE_FAILURE ==
@@ -321,14 +355,15 @@ GST_START_TEST (interpipe_get_caps_two_interpipesrcs_no_intersection)
           GST_CLOCK_TIME_NONE));
 
   /* The renegotiation runs on the producer's streaming thread; give it time
-   * to fail the intersection and detach both listeners. */
-  for (i = 0; i < 50; i++) {
-    g_object_get (intersink, "num-listeners", &num_listeners, NULL);
-    if (num_listeners == 0)
-      break;
-    g_usleep (100 * 1000);
-  }
-  fail_unless_equals_int (num_listeners, 0);
+   * to detach the second listener. */
+  wait_num_listeners (intersink, 1);
+
+  /* The first listener is still served, and keeps being served. */
+  for (i = 0; i < 3; i++)
+    wait_for_sample (src1, "asink1");
+  wait_num_listeners (intersink, 1);
+  fail_if (got_sample (src2, "asink2", 0),
+      "The incompatible listener received a buffer");
 
   fail_if (pipeline_has_error (sink, &errmsg),
       "Producer pipeline posted an error: %s", errmsg);

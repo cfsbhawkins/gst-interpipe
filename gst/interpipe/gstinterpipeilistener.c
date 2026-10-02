@@ -183,3 +183,20 @@ gst_inter_pipe_ilistener_send_eos (GstInterPipeIListener * self)
 
   return iface->send_eos (self);
 }
+
+
+/* Tells the listener that the latency its node renders with has changed. The
+ * node calls this from the producer's pipeline, possibly with its listeners
+ * lock held, so implementations must only record the fact and act on it from
+ * their own thread. Optional: listeners that do not care leave it unset. */
+void
+gst_inter_pipe_ilistener_latency_changed (GstInterPipeIListener * self)
+{
+  GstInterPipeIListenerInterface *iface;
+
+  g_return_if_fail (GST_INTER_PIPE_IS_ILISTENER (self));
+
+  iface = GST_INTER_PIPE_ILISTENER_GET_IFACE (self);
+  if (iface->latency_changed)
+    iface->latency_changed (self);
+}

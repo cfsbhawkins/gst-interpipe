@@ -38,6 +38,7 @@ check_PROGRAMS = gst/test_allow_renegotiation_property \
                  gst/test_node_name_removed \
                  gst/test_out_of_bounds_events \
                  gst/test_out_of_bounds_upstream_events \
+                 gst/test_preroll_forwarding \
                  gst/test_producer_latency \
                  gst/test_reconfigure_event \
                  gst/test_set_caps
