@@ -30,6 +30,7 @@ check_PROGRAMS = gst/test_allow_renegotiation_property \
                  gst/test_cold_attach \
                  gst/test_force_key_unit_event \
                  gst/test_stream_sync \
+                 gst/test_stream_sync_retiming \
                  gst/test_get_caps \
                  gst/test_hot_plug \
                  gst/test_in_bounds_events \

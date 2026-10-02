@@ -105,6 +105,8 @@ static gboolean gst_inter_pipe_src_query (GstBaseSrc * base, GstQuery * query);
 static GstClockTime gst_inter_pipe_src_node_latency (GstInterPipeSrc * src);
 static void gst_inter_pipe_src_request_latency_recalculation (GstInterPipeSrc *
     src);
+static GstEvent *gst_inter_pipe_src_own_segment (GstInterPipeSrc * src,
+    GstEvent * producer);
 static void gst_inter_pipe_ilistener_init (GstInterPipeIListenerInterface *
     iface);
 
@@ -671,12 +673,43 @@ gst_inter_pipe_src_create (GstBaseSrc * base, guint64 offset, guint size,
   g_mutex_unlock (&src->serial_events_lock);
 
   while ((serial_event = g_queue_pop_head (&due_events)) != NULL) {
+    if (GST_EVENT_TYPE (serial_event) == GST_EVENT_SEGMENT
+        && GST_INTER_PIPE_SRC_RESTART_TIMESTAMP == src->stream_sync)
+      serial_event = gst_inter_pipe_src_own_segment (src, serial_event);
+
     GST_DEBUG_OBJECT (src, "Sending Serial Event %s",
         GST_EVENT_TYPE_NAME (serial_event));
     gst_pad_push_event (srcpad, serial_event);
   }
 
   return ret;
+}
+
+/* restart-ts re-stamps every buffer with this element's running time, so the
+ * producer's segment describes a timeline these buffers no longer use. A
+ * producer whose segment does not start at 0 (an encoder that offsets its
+ * timestamps so DTS never goes negative, say) would make every downstream
+ * element clip the re-stamped buffers as out of segment. Send this element's
+ * own segment instead, which is the one the re-stamped buffers belong to. It
+ * is not simply dropped: a forwarded FLUSH_STOP clears the sticky segment
+ * downstream, and the producer's segment after it is what restores one.
+ * Takes ownership of the producer's segment event. */
+static GstEvent *
+gst_inter_pipe_src_own_segment (GstInterPipeSrc * src, GstEvent * producer)
+{
+  GstBaseSrc *base = GST_BASE_SRC (src);
+  GstEvent *own;
+
+  GST_OBJECT_LOCK (src);
+  own = gst_event_new_segment (&base->segment);
+  GST_OBJECT_UNLOCK (src);
+
+  gst_event_set_seqnum (own, gst_event_get_seqnum (producer));
+  GST_DEBUG_OBJECT (src, "Replacing producer %" GST_PTR_FORMAT " with %"
+      GST_PTR_FORMAT, producer, own);
+  gst_event_unref (producer);
+
+  return own;
 }
 
 /* GstInterPipeIListener Implementation */
