@@ -43,6 +43,7 @@
 #endif
 
 #include <gst/gst.h>
+#include <gst/base/gstbasesink.h>
 #include "gstinterpipe.h"
 #include "gstinterpipesrc.h"
 #include "gstinterpipeilistener.h"
@@ -100,6 +101,10 @@ static gboolean gst_inter_pipe_src_start (GstBaseSrc * base);
 static gboolean gst_inter_pipe_src_stop (GstBaseSrc * base);
 static gboolean gst_inter_pipe_src_negotiate (GstBaseSrc * base);
 static gboolean gst_inter_pipe_src_event (GstBaseSrc * base, GstEvent * event);
+static gboolean gst_inter_pipe_src_query (GstBaseSrc * base, GstQuery * query);
+static GstClockTime gst_inter_pipe_src_node_latency (GstInterPipeSrc * src);
+static void gst_inter_pipe_src_request_latency_recalculation (GstInterPipeSrc *
+    src);
 static void gst_inter_pipe_ilistener_init (GstInterPipeIListenerInterface *
     iface);
 
@@ -163,6 +168,11 @@ struct _GstInterPipeSrc
 
   /* Stream synchronization */
   GstInterPipeSrcStreamSync stream_sync;
+
+  /* Producer render latency last added to this element's LATENCY answer.
+   * Written from the node's streaming thread, read by the latency query;
+   * guarded by the object lock. See gst_inter_pipe_src_query. */
+  GstClockTime producer_latency;
 
   /* Accept the events received from the interpipesink */
   gboolean accept_events;
@@ -242,6 +252,7 @@ gst_inter_pipe_src_class_init (GstInterPipeSrcClass * klass)
   basesrc_class->negotiate = GST_DEBUG_FUNCPTR (gst_inter_pipe_src_negotiate);
   basesrc_class->event = GST_DEBUG_FUNCPTR (gst_inter_pipe_src_event);
   basesrc_class->create = GST_DEBUG_FUNCPTR (gst_inter_pipe_src_create);
+  basesrc_class->query = GST_DEBUG_FUNCPTR (gst_inter_pipe_src_query);
 }
 
 static void
@@ -258,6 +269,7 @@ gst_inter_pipe_src_init (GstInterPipeSrc * src)
   src->first_switch = TRUE;
   src->caps_primed = FALSE;
   src->stream_sync = GST_INTER_PIPE_SRC_PASSTHROUGH_TIMESTAMP;
+  src->producer_latency = 0;
   src->accept_events = TRUE;
   src->accept_eos_event = TRUE;
 }
@@ -598,6 +610,34 @@ gst_inter_pipe_src_create (GstBaseSrc * base, guint64 offset, guint size,
   GST_LOG_OBJECT (src,
       "Dequeue buffer %p with timestamp (PTS) %" GST_TIME_FORMAT, *buf,
       GST_TIME_ARGS (GST_BUFFER_PTS (*buf)));
+
+  /* Checked here, on this element's own streaming thread, not in push_buffer:
+   * that runs under the producer's listeners lock, and the node lookup takes
+   * the global nodes lock, which node registration takes in the opposite
+   * order.
+   *
+   * The producer's pipeline usually settles its latency after this element's
+   * pipeline has already computed its own (a live source that connects late,
+   * a decoder that reports latency once it has caps). When the producer's
+   * render latency moves, ask this pipeline to recompute so the LATENCY
+   * answer below is re-read. Restart-ts re-stamps on arrival and never needs
+   * it. */
+  if (GST_INTER_PIPE_SRC_RESTART_TIMESTAMP != src->stream_sync) {
+    GstClockTime latency = gst_inter_pipe_src_node_latency (src);
+    gboolean changed;
+
+    GST_OBJECT_LOCK (src);
+    changed = latency != src->producer_latency;
+    GST_OBJECT_UNLOCK (src);
+    if (changed) {
+      GST_INFO_OBJECT (src, "Producer render latency now %" GST_TIME_FORMAT
+          ", recalculating pipeline latency", GST_TIME_ARGS (latency));
+      GST_OBJECT_LOCK (src);
+      src->producer_latency = latency;
+      GST_OBJECT_UNLOCK (src);
+      gst_inter_pipe_src_request_latency_recalculation (src);
+    }
+  }
 
   /* Drain the head serial event if its timestamp has been reached. Decide and
    * dequeue under the lock, but push the event downstream after releasing it so
@@ -964,6 +1004,104 @@ gst_inter_pipe_src_send_eos (GstInterPipeIListener * iface)
   return TRUE;
 }
 
+
+/* The latency the producer's pipeline renders with, or 0 when it is not
+ * clock-synced. A `sync=true` interpipesink hands each buffer over only once
+ * its pipeline latency has elapsed, so under compensate-ts (and passthrough)
+ * every buffer reaches this element that much behind its running time. */
+static GstClockTime
+gst_inter_pipe_src_node_latency (GstInterPipeSrc * src)
+{
+  GstInterPipeINode *node;
+  GstClockTime latency = 0;
+  gchar *listen_to;
+
+  GST_OBJECT_LOCK (src);
+  listen_to = g_strdup (src->listen_to);
+  GST_OBJECT_UNLOCK (src);
+
+  node = listen_to ? gst_inter_pipe_get_node (listen_to) : NULL;
+  g_free (listen_to);
+  if (!node)
+    return 0;
+
+  if (GST_IS_BASE_SINK (node) && gst_base_sink_get_sync (GST_BASE_SINK (node))) {
+    latency = gst_base_sink_get_latency (GST_BASE_SINK (node));
+    if (!GST_CLOCK_TIME_IS_VALID (latency))
+      latency = 0;
+  }
+  gst_object_unref (node);
+  return latency;
+}
+
+static void
+gst_inter_pipe_src_recalculate_latency (GstElement * element,
+    gpointer user_data)
+{
+  gst_bin_recalculate_latency (GST_BIN (element));
+}
+
+/* GstBin only recomputes latency on a state change; a LATENCY message is left
+ * to the application, and gstd does not handle it. Recalculate on the
+ * top-level bin ourselves, off this streaming thread: the recalculation
+ * queries and re-configures every sink, which must not run inside a buffer
+ * flow. */
+static void
+gst_inter_pipe_src_request_latency_recalculation (GstInterPipeSrc * src)
+{
+  GstObject *top = gst_object_ref (GST_OBJECT (src));
+  GstObject *parent;
+
+  while ((parent = gst_object_get_parent (top)) != NULL) {
+    gst_object_unref (top);
+    top = parent;
+  }
+  if (GST_IS_BIN (top))
+    gst_element_call_async (GST_ELEMENT (top),
+        gst_inter_pipe_src_recalculate_latency, NULL, NULL);
+  else
+    gst_element_post_message (GST_ELEMENT (src),
+        gst_message_new_latency (GST_OBJECT (src)));
+  gst_object_unref (top);
+}
+
+static gboolean
+gst_inter_pipe_src_query (GstBaseSrc * base, GstQuery * query)
+{
+  GstInterPipeSrc *src = GST_INTER_PIPE_SRC (base);
+  gboolean ret;
+
+  ret = GST_BASE_SRC_CLASS (gst_inter_pipe_src_parent_class)->query (base,
+      query);
+
+  /* Report the producer's render latency as upstream latency of this live
+   * source. Without it a consumer pipeline believes buffers are due the moment
+   * they are produced and treats every one as that much late: a fallbackswitch
+   * drops them as trailing once the producer's latency exceeds its timeout,
+   * and every clock-synced element downstream mis-schedules them. */
+  if (ret && GST_QUERY_TYPE (query) == GST_QUERY_LATENCY
+      && GST_INTER_PIPE_SRC_RESTART_TIMESTAMP != src->stream_sync) {
+    gboolean live;
+    GstClockTime min, max, producer;
+
+    gst_query_parse_latency (query, &live, &min, &max);
+    producer = gst_inter_pipe_src_node_latency (src);
+    if (live && producer > 0) {
+      min += producer;
+      if (GST_CLOCK_TIME_IS_VALID (max))
+        max += producer;
+      gst_query_set_latency (query, live, min, max);
+    }
+    GST_OBJECT_LOCK (src);
+    src->producer_latency = producer;
+    GST_OBJECT_UNLOCK (src);
+    GST_DEBUG_OBJECT (src, "Latency query: live %d, min %" GST_TIME_FORMAT
+        " (producer %" GST_TIME_FORMAT "), max %" GST_TIME_FORMAT, live,
+        GST_TIME_ARGS (min), GST_TIME_ARGS (producer), GST_TIME_ARGS (max));
+  }
+
+  return ret;
+}
 
 static gboolean
 gst_inter_pipe_src_push_query (GstInterPipeIListener * iface, GstQuery * query)
