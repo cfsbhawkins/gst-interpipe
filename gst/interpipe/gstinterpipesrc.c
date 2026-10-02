@@ -232,7 +232,10 @@ gst_inter_pipe_src_class_init (GstInterPipeSrcClass * klass)
 
   g_object_class_install_property (gobject_class, PROP_STREAM_SYNC,
       g_param_spec_enum ("stream-sync", "Stream Synchronization",
-          "Define buffer synchronization between the different pipelines",
+          "Define buffer synchronization between the different pipelines. "
+          "With passthrough-ts and compensate-ts the producer's render latency "
+          "is reported through this element's latency query, which the "
+          "downstream pipeline only applies when is-live is true",
           GST_TYPE_INTER_PIPE_SRC_STREAM_SYNC,
           GST_INTER_PIPE_SRC_PASSTHROUGH_TIMESTAMP,
           G_PARAM_WRITABLE | G_PARAM_STATIC_STRINGS));
@@ -611,10 +614,11 @@ gst_inter_pipe_src_create (GstBaseSrc * base, guint64 offset, guint size,
       "Dequeue buffer %p with timestamp (PTS) %" GST_TIME_FORMAT, *buf,
       GST_TIME_ARGS (GST_BUFFER_PTS (*buf)));
 
-  /* Checked here, on this element's own streaming thread, not in push_buffer:
-   * that runs under the producer's listeners lock, and the node lookup takes
-   * the global nodes lock, which node registration takes in the opposite
-   * order.
+  /* Checked here, on this element's own streaming thread, rather than in
+   * push_buffer, which runs on the producer's streaming thread under its
+   * listeners lock: the node lookup takes the global nodes lock, and keeping
+   * it out of the producer's fan-out loop keeps it from stalling every
+   * listener of the node.
    *
    * The producer's pipeline usually settles its latency after this element's
    * pipeline has already computed its own (a live source that connects late,
@@ -628,13 +632,11 @@ gst_inter_pipe_src_create (GstBaseSrc * base, guint64 offset, guint size,
 
     GST_OBJECT_LOCK (src);
     changed = latency != src->producer_latency;
+    src->producer_latency = latency;
     GST_OBJECT_UNLOCK (src);
     if (changed) {
       GST_INFO_OBJECT (src, "Producer render latency now %" GST_TIME_FORMAT
           ", recalculating pipeline latency", GST_TIME_ARGS (latency));
-      GST_OBJECT_LOCK (src);
-      src->producer_latency = latency;
-      GST_OBJECT_UNLOCK (src);
       gst_inter_pipe_src_request_latency_recalculation (src);
     }
   }
