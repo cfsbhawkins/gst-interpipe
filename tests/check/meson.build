@@ -14,6 +14,7 @@ core_tests = [
   [ 'gst/test_node_name_removed.c' ],
   [ 'gst/test_out_of_bounds_events.c' ],
   [ 'gst/test_out_of_bounds_upstream_events.c' ],
+  [ 'gst/test_producer_latency.c' ],
   [ 'gst/test_reconfigure_event.c' ],
   [ 'gst/test_set_caps.c' ],
 ]
